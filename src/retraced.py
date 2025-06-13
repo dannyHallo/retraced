@@ -1,66 +1,24 @@
 #!/usr/bin/env python3
 # ==============================================================
-#  film_grain_poisson.py -- Taichi port of the Poisson-grain shader
+#  poisson_grain.py – silver-halide grain toy model (Taichi ≥1.6)
 # ==============================================================
 
-"""
-Original GLSL:  https://www.shadertoy.com/...   (snippet provided by the user)
-
-Porting notes
--------------
-1. All random-number helpers (Wang hash, XorShift, Box--Muller, Poisson) are
-   translated to `@ti.func` the same way they were used in GLSL.
-
-2. The shader’s `mainImage()` becomes one big Taichi kernel that fills a 2-D
-   field `film` (float32, 0 … 1).  Each thread / SPMD instance computes one
-   output pixel, runs the *identical* Monte-Carlo loop `NUM_SAMPLES = 100`.
-
-3. What used to be shader uniforms are now normal CLI flags:
-      --grain_radius   (float, px)  same as `grainRadius` in GLSL
-      --grain_sigma    (float, px)  deviation of the log-normal radius
-      --sigma_filter   (float, px)  spatial Gaussian blur of the source image
-      --samples        (# int)      Monte-Carlo samples per pixel
-
-4. Performance: a 1080 p frame with 100 samples takes ≈ 0.2 s on an RTX-3070
-   (Taichi CUDA) or ≈ 4 s on an 8-core laptop CPU.  If you need real-time,
-   drop `--samples`, or rewrite the nested Poisson loops using a density
-   grid as an acceleration structure.
-
-5. The shader used `uMax = 2 .0` because the author fed HDR data.  If your
-   source image is already in [0 ,1] you can leave the default or expose it
-   as yet another CLI flag.
-
-"""
-
-import math, argparse
+import math, argparse, os
+from pathlib import Path
 from PIL import Image
 import numpy as np
 import taichi as ti
-from taichi import math as tm
+import taichi.math as tm
 
-
-# ──────────────────────────────────────────────────────────────
-#  CLI
-# ──────────────────────────────────────────────────────────────
-cli = argparse.ArgumentParser("Poisson-grain film simulator (Taichi)")
-cli.add_argument("--input", required=True, help="source image (LDR or HDR → L)")
-cli.add_argument("--height", type=int, default=1080, help="output height [px]")
-cli.add_argument(
-    "--grain_radius", type=float, default=1.25, help="mean grain radius [px]"
-)
-cli.add_argument(
-    "--grain_sigma", type=float, default=0.40, help="σ of log-normal radius [px]"
-)
-cli.add_argument(
-    "--sigma_filter", type=float, default=0.8, help="σ of spatial pixel blur"
-)
-cli.add_argument(
-    "--lambda_scale",
-    type=float,
-    default=1.0,
-    help="extra multiplier for Poisson λ (grain density)",
-)
-cli.add_argument("--samples", type=int, default=100, help="# Monte-Carlo samples / px")
+# ────────────────  CLI  ───────────────────────────────────────
+cli = argparse.ArgumentParser(description="Poisson-grain film simulator")
+cli.add_argument("--input", required=True)
+cli.add_argument("--height", type=int, default=1080)
+cli.add_argument("--grain_radius", type=float, default=1.25)
+cli.add_argument("--grain_sigma", type=float, default=0.40)
+cli.add_argument("--sigma_filter", type=float, default=0.8)
+cli.add_argument("--lambda_scale", type=float, default=1.0)
+cli.add_argument("--samples", type=int, default=100)
 cli.add_argument("--output", default="grain.png")
 cli.add_argument(
     "--arch", default="cuda", choices=["auto", "cuda", "cpu", "vulkan", "metal"]
@@ -68,229 +26,171 @@ cli.add_argument(
 args = cli.parse_args()
 
 
-# ──────────────────────────────────────────────────────────────
-#  Taichi init
-# ──────────────────────────────────────────────────────────────
-def pick(arch):
-    if arch != "auto":
-        return getattr(ti, arch)
-    return ti.gpu if ti.is_gpu_supported() else ti.cpu
+# ────────────────  Taichi init  ───────────────────────────────
+def pick(a):
+    return (
+        getattr(ti, a) if a != "auto" else (ti.gpu if ti.is_gpu_supported() else ti.cpu)
+    )
 
 
 ti.init(arch=pick(args.arch), default_ip=ti.i32, random_seed=0)
 print("[Taichi] arch:", ti.cfg.arch)
 
-# ──────────────────────────────────────────────────────────────
-#  Load source image  →  grayscale float32 in [0, 1]
-# ──────────────────────────────────────────────────────────────
-src_img = Image.open(args.input).convert("L")
-H, W = args.height, round(src_img.width * args.height / src_img.height)
-src_np = np.asarray(src_img.resize((W, H), Image.LANCZOS), np.float32) / 255.0
-
-# texture look-ups (shader → Taichi): treat input as a simple 2-D array
-src_tex = ti.field(dtype=ti.f32, shape=(H, W))
+# ────────────────  Source image  ─────────────────────────────
+src = Image.open(args.input).convert("L")
+H, W = args.height, round(src.width * args.height / src.height)
+src_np = np.asarray(src.resize((W, H), Image.LANCZOS), np.float32) * (1 / 255)
+src_tex = ti.field(ti.f32, shape=(H, W))
 src_tex.from_numpy(src_np)
 
-# ──────────────────────────────────────────────────────────────
-#  Output buffer
-# ──────────────────────────────────────────────────────────────
-film = ti.field(dtype=ti.f32, shape=(H, W))  # 0 … 1   (higher = more opaque grain)
+# ────────────────  Buffers  ──────────────────────────────────
+neg = ti.field(ti.f32, shape=(H, W))  # silver density
 
-# ──────────────────────────────────────────────────────────────
-#  Constants
-# ──────────────────────────────────────────────────────────────
-NUM_SAMPLES = args.samples
-grainRadius = args.grain_radius
-grainSigma = args.grain_sigma
-sigmaFilter = args.sigma_filter
-uMax = 2.0  # matches original shader
-epsilon = 1e-5
-pi = math.pi
-ag = 1.0 / math.ceil(1.0 / grainRadius)  # cell size ( = “a_g”)
-grainRadiusSq = grainRadius * grainRadius
-sigmaSq = 0.0 if grainSigma == 0 else math.log((grainSigma / grainRadius) ** 2 + 1)
-sigma_ln = math.sqrt(sigmaSq) if grainSigma > 0 else 0.0
-mu_ln = (math.log(grainRadius) - 0.5 * sigmaSq) if grainSigma > 0 else 0.0
-normalQuant = 3.0902
-maxRadius = grainRadius if grainSigma == 0 else math.exp(mu_ln + sigma_ln * normalQuant)
-maxRadiusSq = maxRadius * maxRadius
-
-# pre-compute factor that appears in λ
-lambda_fac = (ag * ag) / (pi * (grainRadiusSq + grainSigma * grainSigma))
-lambda_scale = args.lambda_scale
-
-# ──────────────────────────────────────────────────────────────
-#  RNG helpers (straight port from GLSL)
-# ──────────────────────────────────────────────────────────────
+# ────────────────  Constants  ────────────────────────────────
+S = args.samples
+R, SIG = args.grain_radius, args.grain_sigma
+SIG_F = args.sigma_filter
+uMax, eps, π = 2.0, 1e-5, math.pi
+ag = 1.0 / math.ceil(1.0 / R)
+R2 = R * R
+sigma2_ln = 0.0 if SIG == 0 else math.log((SIG / R) ** 2 + 1)
+sigma_ln = math.sqrt(sigma2_ln) if SIG > 0 else 0.0
+mu_ln = math.log(R) - 0.5 * sigma2_ln
+maxR = R if SIG == 0 else math.exp(mu_ln + 3.0902 * sigma_ln)
+λ_fac = ag * ag / (π * (R2 + SIG * SIG))
+λ_scale = args.lambda_scale
 U32 = ti.u32
 
-# --- FIX START: Define structs for returning multiple values from functions ---
-RNG_Result_f32 = ti.types.struct(new_state=U32, value=ti.f32)
-RNG_Result_u32 = ti.types.struct(new_state=U32, value=U32)
-# --- FIX END ---
 
-
+# ────────────────  RNG helpers (pure)  ───────────────────────
 @ti.func
-def wang_hash(seed: U32) -> U32:
+def wang(seed: U32) -> U32:
     seed = (seed ^ 61) ^ (seed >> 16)
     seed *= 9
-    seed = seed ^ (seed >> 4)
+    seed ^= seed >> 4
     seed *= 668265261
-    seed = seed ^ (seed >> 15)
+    seed ^= seed >> 15
     return seed
 
 
 @ti.func
-def lcg_xorshift(state: U32) -> U32:
-    state ^= state << 13
-    state ^= state >> 17
-    state ^= state << 5
-    return state
+def xor_shift(s: U32) -> U32:
+    s ^= s << 13
+    s ^= s >> 17
+    s ^= s << 5
+    return s
 
 
-# --- FIX START: Refactor RNG functions to return structs ---
-@ti.func
-def rand_uniform(state: U32) -> RNG_Result_f32:
-    new_state = lcg_xorshift(state)
-    rand_val = ti.cast(new_state, ti.f32) / 4294967295.0
-    return RNG_Result_f32(new_state=new_state, value=rand_val)
-
-
-@ti.func
-def rand_gaussian(state: U32) -> RNG_Result_f32:  # Box--Muller
-    res_u = rand_uniform(state)
-    res_v = rand_uniform(res_u.new_state)
-
-    u = res_u.value
-    v = res_v.value
-
-    r = ti.sqrt(-2.0 * ti.log(u + 1e-12))
-    phi = 2.0 * pi * v
-    gauss_val = r * ti.cos(phi)
-
-    return RNG_Result_f32(new_state=res_v.new_state, value=gauss_val)
+@ti.dataclass
+class Rnd:
+    s: ti.u32
+    v: ti.f32
 
 
 @ti.func
-def rand_poisson(state: U32, lamb: ti.f32, expLambda: ti.f32) -> RNG_Result_u32:
-    res_u = rand_uniform(state)
-    u = res_u.value
-
-    x = U32(0)
-    prod = expLambda  # e^(−λ)
-    summ = prod
-    limit = ti.floor(10000.0 * lamb)  # shader’s arbitrary safety limit
-    while (u > summ) and (x < limit):
-        x = x + 1
-        prod = prod * lamb / ti.cast(x, ti.f32)
-        summ = summ + prod
-
-    return RNG_Result_u32(new_state=res_u.new_state, value=x)
-
-
-# --- FIX END ---
+def rnd01(state: U32) -> Rnd:
+    ns = xor_shift(state)
+    return Rnd(ns, ns * (1.0 / 4294967295.0))
 
 
 @ti.func
-def sqDist(x1, y1, x2, y2):
-    dx = x1 - x2
-    dy = y1 - y2
-    return dx * dx + dy * dy
+def rnd_gauss(state: U32) -> Rnd:
+    r1 = rnd01(state)
+    r2 = rnd01(r1.s)
+    r = ti.sqrt(-2 * ti.log(r1.v + 1e-12))
+    return Rnd(r2.s, r * ti.cos(2 * π * r2.v))
 
 
-# ──────────────────────────────────────────────────────────────
-#  Main kernel  (port of mainImage)
-# ──────────────────────────────────────────────────────────────
+@ti.func
+def rnd_poisson(state: U32, lam, expLam) -> Rnd:
+    r = rnd01(state)
+    u = r.v
+    x, prod, summ = U32(0), expLam, expLam
+    lim = ti.cast(ti.floor(1e4 * lam), U32)
+    while (u > summ) and (x < lim):
+        x += 1
+        prod *= lam / ti.cast(x, ti.f32)
+        summ += prod
+    return Rnd(r.s, x)
+
+
+@ti.func
+def sq(a, b, c, d):
+    return (a - c) * (a - c) + (b - d) * (b - d)
+
+
+# ────────────────  Kernel  ───────────────────────────────────
 @ti.kernel
-def generate(frame: ti.u32):
-    offsetRand = wang_hash(frame)  # frame-constant offset for RNG
-    for py, px in film:  # one thread ≙ one output pixel
-        xOut = ti.cast(px, ti.f32)
-        yOut = ti.cast(py, ti.f32)
-        xIn = xOut * (W / ti.cast(W, ti.f32))
-        yIn = yOut * (H / ti.cast(H, ti.f32))
-        covered = ti.f32(0.0)
-        p_global = wang_hash(U32(py * 73856093 ^ px * 19349663 ^ offsetRand))
+def render(frame: ti.u32):
+    fseed = wang(frame)
+    for py, px in neg:
+        st = wang(U32(py * 73856093 ^ px * 19349663 ^ fseed))  # RNG state
+        hit_sum = 0.0
 
-        for sample_i in range(NUM_SAMPLES):
-            # --- FIX START: Update call sites to use the returned structs ---
-            res_gx = rand_gaussian(p_global)
-            p_global = res_gx.new_state
-            res_gy = rand_gaussian(p_global)
-            p_global = res_gy.new_state
+        for _ in range(S):
+            # jittered sample position
+            g1 = rnd_gauss(st)
+            st = g1.s
+            g2 = rnd_gauss(st)
+            st = g2.s
+            xG = ti.cast(px, ti.f32) + SIG_F * g1.v
+            yG = ti.cast(py, ti.f32) + SIG_F * g2.v
 
-            xG = xIn + sigmaFilter * res_gx.value
-            yG = yIn + sigmaFilter * res_gy.value
-            # --- FIX END ---
+            ix = ti.cast(tm.clamp(ti.floor(xG), 0.0, W - 1.0), ti.i32)
+            iy = ti.cast(tm.clamp(ti.floor(yG), 0.0, H - 1.0), ti.i32)
 
-            ix = tm.clamp(ti.floor(xG, ti.u32), 0, W - 1)
-            iy = tm.clamp(ti.floor(yG, ti.u32), 0, H - 1)
-            u = src_tex[ti.cast(iy, ti.i32), ti.cast(ix, ti.i32)] / (uMax + epsilon)
+            u = src_tex[iy, ix] / (uMax + eps)
+            lam = λ_scale * (-λ_fac * ti.log(1.0 - u))
+            exL = ti.exp(-lam)
 
-            lamb = lambda_scale * (-lambda_fac * ti.log(1.0 - u))
-            expL = ti.exp(-lamb)
+            minX = ti.cast(ti.floor((xG - maxR) / ag), ti.i32)
+            maxX = ti.cast(ti.floor((xG + maxR) / ag), ti.i32)
+            minY = ti.cast(ti.floor((yG - maxR) / ag), ti.i32)
+            maxY = ti.cast(ti.floor((yG + maxR) / ag), ti.i32)
 
-            minX = ti.cast(ti.floor((xG - maxRadius) / ag), ti.i32)
-            maxX = ti.cast(ti.floor((xG + maxRadius) / ag), ti.i32)
-            minY = ti.cast(ti.floor((yG - maxRadius) / ag), ti.i32)
-            maxY = ti.cast(ti.floor((yG + maxRadius) / ag), ti.i32)
-
-            hit = False
-
-            for ncx in range(minX, maxX + 1):
-                if hit:
+            covered = False
+            cx = minX
+            while cx <= maxX:
+                if covered:
                     break
-                for ncy in range(minY, maxY + 1):
-                    if hit:
+                cy = minY
+                while cy <= maxY:
+                    if covered:
                         break
+                    cstate = wang(U32((cy & 0xFFFF) << 16 | (cx & 0xFFFF)) + fseed)
+                    rP = rnd_poisson(cstate, lam, exL)
+                    cstate = rP.s
+                    for z in range(ti.cast(rP.v, ti.i32)):
+                        ru = rnd01(cstate)
+                        cstate = ru.s
+                        rv = rnd01(cstate)
+                        cstate = rv.s
+                        xc = ag * (ti.cast(cx, ti.f32) + ru.v)
+                        yc = ag * (ti.cast(cy, ti.f32) + rv.v)
 
-                    cell_seed = wang_hash(
-                        U32(((ncy & 0xFFFF) << 16) | (ncx & 0xFFFF)) + offsetRand
-                    )
-                    p_cell = cell_seed
-
-                    # --- FIX START: Update call sites to use the returned structs ---
-                    res_poisson = rand_poisson(p_cell, lamb, expL)
-                    p_cell = res_poisson.new_state
-                    Ncell = res_poisson.value
-                    # --- FIX END ---
-
-                    for _ in range(Ncell):
-                        # --- FIX START: Update call sites to use the returned structs ---
-                        res_ux = rand_uniform(p_cell)
-                        p_cell = res_ux.new_state
-                        xCentre = ag * (ti.cast(ncx, ti.f32) + res_ux.value)
-
-                        res_uy = rand_uniform(p_cell)
-                        p_cell = res_uy.new_state
-                        yCentre = ag * (ti.cast(ncy, ti.f32) + res_uy.value)
-
-                        r2 = 0.0
-                        if grainSigma > 0:
-                            res_gauss = rand_gaussian(p_cell)
-                            p_cell = res_gauss.new_state
-                            rad = ti.exp(mu_ln + sigma_ln * res_gauss.value)
-                            rad = ti.min(rad, maxRadius)
+                        r2 = R2
+                        if SIG > 0:
+                            rg = rnd_gauss(cstate)
+                            cstate = rg.s
+                            rad = ti.min(ti.exp(mu_ln + sigma_ln * rg.v), maxR)
                             r2 = rad * rad
-                        else:
-                            r2 = grainRadiusSq
-                        # --- FIX END ---
-
-                        if sqDist(xCentre, yCentre, xG, yG) < r2:
-                            hit = True
+                        if sq(xc, yc, xG, yG) < r2:
+                            covered = True
                             break
+                    cy += 1
+                cx += 1
+            hit_sum += 1 if covered else 0
 
-            if hit:
-                covered += 1.0
-
-        film[py, px] = covered / ti.cast(NUM_SAMPLES, ti.f32)
+        neg[py, px] = hit_sum / S
 
 
-# ──────────────────────────────────────────────────────────────
-#  Run
-# ──────────────────────────────────────────────────────────────
-print(f"[Info] {W}×{H}, {NUM_SAMPLES} samples, r={grainRadius}px σ={grainSigma}px")
-generate(12345)  # frame-constant offsetRand
-out_np = (film.to_numpy() * 255).astype(np.uint8)
-Image.fromarray(out_np, mode="L").save(args.output)
-print("[OK] saved →", args.output)
+# ────────────────  Run & save  ───────────────────────────────
+print(f"[Info] {W}×{H}, {S} samp  R={R}px σ={SIG}px λ×{λ_scale}")
+render(12345)
+
+neg_np = neg.to_numpy()
+pos_np = 1.0 - neg_np
+root, ext = Path(args.output).stem, Path(args.output).suffix or ".png"
+Image.fromarray((neg_np * 255).astype(np.uint8)).save(f"{root}_neg{ext}")
+Image.fromarray((pos_np * 255).astype(np.uint8)).save(f"{root}{ext}")
+print("[OK] saved →", f"{root}_neg{ext}", "&", f"{root}{ext}")
