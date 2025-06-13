@@ -1,7 +1,3 @@
-# ==============================================================
-#  poisson_grain.py – silver-halide grain toy model (Taichi ≥1.6)
-# ==============================================================
-
 import math, argparse
 from pathlib import Path
 from PIL import Image
