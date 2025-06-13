@@ -55,7 +55,7 @@ PyQt6
 1. Clone:
 
    ```bash
-   git clone https://github.com/yourusername/Retraced.git
+   git clone https://github.com/dannyHallo/retraced.git
    cd Retraced
    ```
 
@@ -91,23 +91,6 @@ PyQt6
    ```bash
    python src/scanner.py
    ```
-
----
-
-## 📂 Project Layout
-
-```
-Retraced/
-├── .vscode/
-│   └── settings.json
-├── src/
-│   ├── retraced.py   # B&W Poisson-grain simulator
-│   └── scanner.py    # PyQt6 tone-curve scanner
-├── test-imgs/        # sample inputs
-├── requirements.txt
-├── README.md
-└── LICENSE
-```
 
 ---
 
