@@ -1,6 +1,7 @@
 # =================================================================
 #  scanner_advanced.py -- 高级交互式色调曲线图像查看器 (PyQt6)
 # =================================================================
+#  - [修复] 启用平滑变换，解决图像缩放时出现的锯齿 (Aliasing) 问题。
 #  - [功能升级] 色调曲线从折线升级为平滑的贝塞尔曲线，调整更自然。
 #  - [交互优化] 图像预览区平移操作从鼠标中键更改为更常用的左键拖动。
 #  - [修复] 彻底解决在缩放视图时因坐标类型不匹配导致的 TypeError。
@@ -12,17 +13,34 @@
 
 import sys
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QCheckBox, QFileDialog, QLabel, QSplitter
+    QApplication,
+    QMainWindow,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QCheckBox,
+    QFileDialog,
+    QLabel,
+    QSplitter,
 )
 from PyQt6.QtGui import (
-    QImage, QPixmap, QPainter, QPen, QBrush, QColor, QAction, QPainterPath, QCursor
+    QImage,
+    QPixmap,
+    QPainter,
+    QPen,
+    QBrush,
+    QColor,
+    QAction,
+    QPainterPath,
+    QCursor,
 )
-from PyQt6.QtCore import (
-    Qt, QPointF, pyqtSignal, QEvent
-)
+from PyQt6.QtCore import Qt, QPointF, pyqtSignal, QEvent, QRectF
 from PIL import Image
 import numpy as np
+from PyQt6.QtCore import QSizeF, QRectF, QPointF
+from PyQt6.QtGui  import QPainter, QColor, QPixmap
+
+
 
 # ----------------------------------------------------------------------
 #  支持动态增删节点和贝塞尔曲线的高级曲线控件
@@ -36,7 +54,7 @@ class CurveWidget(QWidget):
         self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
 
         self.points = [QPointF(0.0, 0.0), QPointF(1.0, 1.0)]
-        
+
         self.selected_point_index = -1
         self.dragging_point_index = -1
         self.padding = 20
@@ -56,24 +74,24 @@ class CurveWidget(QWidget):
         """
         sorted_points = sorted(self.points, key=lambda p: p.x())
         if len(sorted_points) < 3:
-            return [] # Not enough points for a Catmull-Rom spline
+            return []  # Not enough points for a Catmull-Rom spline
 
         segments = []
         # Pad points for boundary conditions to calculate tangents at endpoints
         padded = [sorted_points[0]] + sorted_points + [sorted_points[-1]]
 
         for i in range(1, len(padded) - 2):
-            p0 = padded[i-1]
+            p0 = padded[i - 1]
             p1 = padded[i]
-            p2 = padded[i+1]
-            p3 = padded[i+2]
+            p2 = padded[i + 1]
+            p3 = padded[i + 2]
 
             # Convert Catmull-Rom points to Bezier control points.
             # The tension is 0.5, which corresponds to a divisor of 6.0.
             c1 = p1 + (p2 - p0) / 6.0
             c2 = p2 - (p3 - p1) / 6.0
             segments.append((p1, c1, c2, p2))
-            
+
         return segments
 
     def paintEvent(self, event):
@@ -83,18 +101,18 @@ class CurveWidget(QWidget):
         painter.setPen(self.border_pen)
         painter.setBrush(QColor(35, 35, 35))
         painter.drawRect(self.rect())
-        
+
         painter.save()
         w = self.width() - 2 * self.padding
         h = self.height() - 2 * self.padding
         painter.translate(self.padding, self.padding)
-        
+
         # Draw grid
         painter.setPen(self.grid_pen)
         for i in range(1, 4):
             painter.drawLine(0, i * h // 4, w, i * h // 4)
             painter.drawLine(i * w // 4, 0, i * w // 4, h)
-        
+
         painter.setPen(self.curve_pen)
         path = QPainterPath()
         sorted_points = sorted(self.points, key=lambda p: p.x())
@@ -118,9 +136,9 @@ class CurveWidget(QWidget):
                     sc2 = QPointF(c2.x() * w, (1 - c2.y()) * h)
                     sp2 = QPointF(p2.x() * w, (1 - p2.y()) * h)
                     path.cubicTo(sc1, sc2, sp2)
-        
+
         painter.drawPath(path)
-        
+
         # Draw control points
         for i, p in enumerate(self.points):
             px = p.x() * w
@@ -198,12 +216,12 @@ class CurveWidget(QWidget):
 
         # --- [MODIFIED] Generate LUT from Bezier or linear curve ---
         segments = self._calculate_bezier_segments()
-        if not segments: # Use linear interpolation for 2 points
+        if not segments:  # Use linear interpolation for 2 points
             x_coords = [p.x() for p in sorted_points]
             y_coords = [p.y() for p in sorted_points]
             input_values = np.linspace(0.0, 1.0, 256)
             output_values = np.interp(input_values, x_coords, y_coords)
-        else: # Sample the Bezier curve for higher accuracy
+        else:  # Sample the Bezier curve for higher accuracy
             fine_x, fine_y = [], []
             for p1, c1, c2, p2 in segments:
                 # Sample each segment. 100 steps is a good balance of accuracy and performance.
@@ -211,21 +229,24 @@ class CurveWidget(QWidget):
                     t = i / 100.0
                     inv_t = 1.0 - t
                     # The Bezier formula
-                    pt = (inv_t**3 * p1) + \
-                         (3 * inv_t**2 * t * c1) + \
-                         (3 * inv_t * t**2 * c2) + \
-                         (t**3 * p2)
-                    
+                    pt = (
+                        (inv_t**3 * p1)
+                        + (3 * inv_t**2 * t * c1)
+                        + (3 * inv_t * t**2 * c2)
+                        + (t**3 * p2)
+                    )
+
                     # Avoid adding duplicate points at segment boundaries
                     if not fine_x or pt.x() > fine_x[-1]:
-                         fine_x.append(pt.x())
-                         fine_y.append(pt.y())
+                        fine_x.append(pt.x())
+                        fine_y.append(pt.y())
 
             input_values = np.linspace(0.0, 1.0, 256)
             output_values = np.interp(input_values, fine_x, fine_y)
 
         lut = (output_values * 255).clip(0, 255).astype(np.uint8)
         return lut
+
 
 class App(QMainWindow):
     def __init__(self):
@@ -247,40 +268,41 @@ class App(QMainWindow):
         open_action = QAction("打开图片...", self)
         open_action.triggered.connect(self.open_file)
         file_menu.addAction(open_action)
-        
+
         central_widget = QWidget()
         main_layout = QHBoxLayout(central_widget)
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        
+
         self.image_label = QLabel("请从“文件”菜单打开一张图片")
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.image_label.setMinimumSize(400, 400)
         self.image_label.setStyleSheet("background-color: #2b2b2b;")
-        # --- [MODIFIED] Set cursor to indicate panning is possible ---
         self.image_label.setCursor(Qt.CursorShape.OpenHandCursor)
         splitter.addWidget(self.image_label)
-        
+
         controls_widget = QWidget()
         controls_layout = QVBoxLayout(controls_widget)
         controls_widget.setMinimumWidth(300)
         controls_widget.setMaximumWidth(450)
-        
+
         self.invert_check = QCheckBox("反相 (Invert)")
         self.curve_widget = CurveWidget()
-        
+
         controls_layout.addWidget(self.invert_check)
         controls_layout.addWidget(self.curve_widget)
         splitter.addWidget(controls_widget)
         splitter.setSizes([800, 400])
-        
+
         main_layout.addWidget(splitter)
         self.setCentralWidget(central_widget)
-        
+
         self.invert_check.stateChanged.connect(self.process_image)
         self.curve_widget.curveChanged.connect(self.process_image)
 
     def open_file(self):
-        path, _ = QFileDialog.getOpenFileName(self, "打开图片", "", "图片文件 (*.png *.jpg *.jpeg *.tif *.bmp)")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "打开图片", "", "图片文件 (*.png *.jpg *.jpeg *.tif *.bmp)"
+        )
         if path:
             try:
                 self.pil_image = Image.open(path).convert("L")
@@ -291,39 +313,60 @@ class App(QMainWindow):
                 self.image_label.setText("无法加载此图片。")
 
     def process_image(self):
-        if self.pil_image is None: return
+        if self.pil_image is None:
+            return
         arr = np.asarray(self.pil_image, np.uint8)
-        if self.invert_check.isChecked(): arr = 255 - arr
+        if self.invert_check.isChecked():
+            arr = 255 - arr
         lut = self.curve_widget.get_lut()
         arr = lut[arr]
         height, width = arr.shape
-        q_image = QImage(arr.data, width, height, width, QImage.Format.Format_Grayscale8)
+        q_image = QImage(
+            arr.data, width, height, width, QImage.Format.Format_Grayscale8
+        )
         self.processed_pixmap = QPixmap.fromImage(q_image)
         self.update_display()
 
+        
+    
     def update_display(self):
-        if self.processed_pixmap is None: return
-        label_pixmap = QPixmap(self.image_label.size())
-        label_pixmap.fill(QColor("#2b2b2b"))
-        painter = QPainter(label_pixmap)
+        if self.processed_pixmap is None:
+            return
+
+        canvas = QPixmap(self.image_label.size())
+        canvas.fill(QColor("#2b2b2b"))
+
+        painter = QPainter(canvas)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+
+            # --- target rectangle --------------------------------------------------
+            scaled_size   = self.processed_pixmap.size() * self.zoom_factor
+            scaled_size_f = QSizeF(scaled_size)                        # QSizeF!
+            target_pos    = QPointF(
+                (self.image_label.width()  - scaled_size_f.width())  / 2,
+                (self.image_label.height() - scaled_size_f.height()) / 2
+            ) + self.pan_offset
+
+            target_rect = QRectF(target_pos, scaled_size_f)
+
+            # --- draw --------------------------------------------------------------
+            source_rect = QRectF(self.processed_pixmap.rect())         # <-- added
+            painter.drawPixmap(target_rect, self.processed_pixmap, source_rect)
+        finally:
+            painter.end()
+
+        self.image_label.setPixmap(canvas)
         
-        scaled_size = self.processed_pixmap.size() * self.zoom_factor
-        target_pos = QPointF(
-            (self.image_label.width() - scaled_size.width()) / 2,
-            (self.image_label.height() - scaled_size.height()) / 2
-        ) + self.pan_offset
-        
-        # Use toPoint() for the final drawing coordinate to avoid TypeError
-        painter.drawPixmap(target_pos.toPoint(), self.processed_pixmap.scaled(scaled_size))
-        painter.end()
-        self.image_label.setPixmap(label_pixmap)
 
     def fit_to_view(self):
-        if self.processed_pixmap is None: return
+        if self.processed_pixmap is None:
+            return
         label_size = self.image_label.size()
         pixmap_size = self.processed_pixmap.size()
-        if pixmap_size.isEmpty(): return
-        
+        if pixmap_size.isEmpty():
+            return
+
         zoom_x = label_size.width() / pixmap_size.width()
         zoom_y = label_size.height() / pixmap_size.height()
         self.zoom_factor = min(zoom_x, zoom_y)
@@ -337,16 +380,15 @@ class App(QMainWindow):
                 old_zoom = self.zoom_factor
                 self.zoom_factor *= 1.15 if delta > 0 else 1 / 1.15
                 self.zoom_factor = max(0.02, min(self.zoom_factor, 50.0))
-                
+
                 mouse_pos = event.position()
                 center_pos = QPointF(self.image_label.rect().center())
-                
+
                 mouse_vec = mouse_pos - center_pos - self.pan_offset
                 self.pan_offset -= mouse_vec * (self.zoom_factor / old_zoom - 1)
                 self.update_display()
                 return True
 
-            # --- [MODIFIED] Use Left Mouse Button for Panning ---
             if event.type() == QEvent.Type.MouseButtonPress:
                 if event.button() == Qt.MouseButton.LeftButton:
                     self.is_panning = True
@@ -356,7 +398,7 @@ class App(QMainWindow):
                 if event.button() == Qt.MouseButton.RightButton:
                     self.fit_to_view()
                     return True
-            
+
             if event.type() == QEvent.Type.MouseMove and self.is_panning:
                 delta = event.position() - self.last_pan_pos
                 self.pan_offset += delta
@@ -364,17 +406,21 @@ class App(QMainWindow):
                 self.update_display()
                 return True
 
-            if event.type() == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
+            if (
+                event.type() == QEvent.Type.MouseButtonRelease
+                and event.button() == Qt.MouseButton.LeftButton
+            ):
                 if self.is_panning:
                     self.is_panning = False
                     self.image_label.setCursor(Qt.CursorShape.OpenHandCursor)
                     return True
-        
+
         return super().eventFilter(source, event)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.update_display()
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
