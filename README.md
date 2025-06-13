@@ -121,7 +121,7 @@ Retraced/
 
 ## ⚖️ License
 
-MIT © 2025 Your Name
+MIT © 2025 Ruitian Yang 杨瑞天
 
 ---
 
