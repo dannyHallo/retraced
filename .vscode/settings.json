@@ -5,7 +5,7 @@
     "install requirements": "pip install -r requirements.txt",
     "feed gpt": "python gpt-feeder/feeder.py --root ./src/",
 
-    "retraced": "python src/retraced.py --input test-imgs/1.jpg -H 1080 --scale 1 --alpha 3 --coverage 1.0 --rays 8 --arch cuda",
+    "retraced": "python src/retraced.py --input test-imgs/1.jpg --height 3000 --coverage 1.0 --alpha 3 --rays 800 --arch cuda",
     "scanner": "python src/scanner.py"
   }
 }
