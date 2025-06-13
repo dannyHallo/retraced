@@ -1,9 +1,8 @@
-#!/usr/bin/env python3
 # ==============================================================
 #  poisson_grain.py – silver-halide grain toy model (Taichi ≥1.6)
 # ==============================================================
 
-import math, argparse, os
+import math, argparse
 from pathlib import Path
 from PIL import Image
 import numpy as np
@@ -19,21 +18,12 @@ cli.add_argument("--grain_sigma", type=float, default=0.40)
 cli.add_argument("--sigma_filter", type=float, default=0.8)
 cli.add_argument("--lambda_scale", type=float, default=1.0)
 cli.add_argument("--samples", type=int, default=100)
-cli.add_argument("--output", default="grain.png")
-cli.add_argument(
-    "--arch", default="cuda", choices=["auto", "cuda", "cpu", "vulkan", "metal"]
-)
+cli.add_argument("--output", default="out.png")
 args = cli.parse_args()
 
 
-# ────────────────  Taichi init  ───────────────────────────────
-def pick(a):
-    return (
-        getattr(ti, a) if a != "auto" else (ti.gpu if ti.is_gpu_supported() else ti.cpu)
-    )
-
-
-ti.init(arch=pick(args.arch), default_ip=ti.i32, random_seed=0)
+# let taichi pick the best available arch for gpu
+ti.init(arch=ti.gpu, default_ip=ti.i32, random_seed=0)
 print("[Taichi] arch:", ti.cfg.arch)
 
 # ────────────────  Source image  ─────────────────────────────
@@ -181,7 +171,7 @@ def render(frame: ti.u32):
                 cx += 1
             hit_sum += 1 if covered else 0
 
-        neg[py, px] = hit_sum / S
+        neg[py, px] = 1.0 - (hit_sum / S)
 
 
 # ────────────────  Run & save  ───────────────────────────────
