@@ -1,0 +1,11 @@
+{
+  "command-runner.commands": {
+    "create env": "conda create -n retraced-demo python=3.12 -y",
+    "activate env": "conda activate retraced-demo",
+    "install requirements": "pip install -r requirements.txt",
+    "feed gpt": "python gpt-feeder/feeder.py --root ./src/",
+
+    "retraced": "python src/retraced.py --input test.jpg -H 3000 --scale 1 --coverage 2.0 --alpha 3",
+    "scanner": "python src/scanner.py"
+  }
+}

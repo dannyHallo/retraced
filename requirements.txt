@@ -1,0 +1,5 @@
+# --- core ---
+taichi>=1.5.0         # 自动选择 CPU / CUDA / Vulkan / Metal 后端
+numpy>=1.21           # 数值运算
+pillow>=10.0          # 读写 PNG/JPEG 等
+PyQt6
