@@ -5,7 +5,7 @@
     "install requirements": "pip install -r requirements.txt",
     "feed gpt": "python gpt-feeder/feeder.py --root ./ --ignore ./.git/ ./gpt-feeder/",
 
-    "retraced": "python src/retraced.py --input test-imgs/1.jpg --height 3000 --samples 200 --lambda_scale 3.0 --grain_radius 0.2 --grain_sigma 0.05 --sigma_filter 0.4",
+    "retraced": "python src/retraced.py --input test-imgs/1.jpg --height 4000 --samples 200 --lambda_scale 3.0 --grain_radius 0.2 --grain_sigma 0.05 --sigma_filter 0.4",
     "scanner": "python src/scanner.py"
   },
   "python.analysis.diagnosticSeverityOverrides": {
