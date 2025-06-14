@@ -37,31 +37,36 @@ args = cli.parse_args()
 # ─────────────────────────── Read film-config ────────────────────────────────
 cfg: Dict = toml.loads(Path(args.film_cfg).read_text())
 
+# Differentiate film type at the highest level
+film_type = cfg.get("type", "").upper()
+if film_type not in ("BW", "NEG"):
+    raise ValueError("film-config.toml must specify type: 'BW' or 'NEG'")
+
 layers_cfg: List[Dict] = cfg.get("layer", [])
 if not layers_cfg:
     raise ValueError("film-config.toml must contain at least one [[layer]]")
 
-valid_col = {"R", "G", "B", "L"}  # L = monochrome luminance layer
-valid_filt = {"red", "green", "blue", "cyan", "magenta", "yellow", None}
+# Validate layers based on film type
+if film_type == "BW" and len(layers_cfg) != 1:
+    raise ValueError("Film type 'BW' requires exactly one [[layer]].")
 
+valid_colors_neg = {"R", "G", "B"}
 for i, lay in enumerate(layers_cfg):
-    # --- colour ----------------------------------------------------------------
     colour = str(lay.get("color", "")).upper()
-    if colour not in valid_col:
-        raise ValueError(f"layer {i}: unknown colour '{colour}'")
+    if film_type == "BW":
+        if colour != "L":
+            raise ValueError(f"Layer {i}: BW film layers must have color = 'L'")
+    elif film_type == "NEG":
+        if colour not in valid_colors_neg:
+            raise ValueError(
+                f"Layer {i}: NEG film layers must have color 'R', 'G', or 'B', not '{colour}'"
+            )
     lay["color"] = colour
 
     # --- numerical defaults ----------------------------------------------------
     lay.setdefault("grain_radius", 1.25)
     lay.setdefault("grain_sigma", 0.40)
     lay.setdefault("sigma_filter", 0.80)
-
-    # --- optional filter -------------------------------------------------------
-    filt_raw = lay.get("filter")  # may be missing / None / "" / string
-    filt = None if filt_raw in (None, "", "None", "none") else str(filt_raw).lower()
-    if filt not in valid_filt:
-        raise ValueError(f"layer {i}: unknown filter '{filt_raw}'")
-    lay["filter"] = filt  # will be None when no filter is present
 
 # ──────────────────────── Derived global sizes ───────────────────────────────
 SS = max(1, args.supersample)  # supersampling factor
@@ -92,14 +97,6 @@ print(f"[Info] simulation size: {W_sim}×{H_sim}  (SS×{SS})")
 
 # ────────────────────── Helper: create per-layer source ───────────────────────
 rgb_index = {"R": 0, "G": 1, "B": 2}
-block_by_filter = {
-    "red": (0,),
-    "cyan": (0,),
-    "green": (1,),
-    "magenta": (1,),
-    "blue": (2,),
-    "yellow": (2,),
-}
 
 
 def luminance(rgb: np.ndarray) -> np.ndarray:
@@ -110,26 +107,19 @@ def luminance(rgb: np.ndarray) -> np.ndarray:
 
 
 src_layers: List[np.ndarray] = []
-working_rgb = img_lin.copy()  # mutable buffer that filters punch holes in
 for i, lay in enumerate(layers_cfg):
     colour = lay["color"]
     if colour == "L":
-        src = luminance(working_rgb)
-    else:
-        src = working_rgb[..., rgb_index[colour]].astype(np.float32)
+        src = luminance(img_lin)
+    else:  # 'R', 'G', or 'B'
+        src = img_lin[..., rgb_index[colour]].astype(np.float32)
     src_layers.append(src)
-
-    # apply filter (blocks one primary) for layers BELOW this one
-    filt = lay["filter"]
-    if filt:
-        for ch in block_by_filter[filt]:
-            working_rgb[..., ch] = 0.0
 
 # ───────────────────────── Taichi fields & buffers ────────────────────────────
 src_tex = ti.field(dtype=ti.f32, shape=(H_sim, W_sim))  # current layer source
 neg = ti.field(dtype=ti.f32, shape=(H_sim, W_sim))  # rendered negative layer
 
-# per-layer physical parameters – scalar 0-D Taichi fields (cheap to update)
+# per-layer physical parameters -- scalar 0-D Taichi fields (cheap to update)
 R_f = ti.field(dtype=ti.f32, shape=())
 SIG_f = ti.field(dtype=ti.f32, shape=())
 SIGF_f = ti.field(dtype=ti.f32, shape=())
@@ -310,7 +300,7 @@ for idx, lay in enumerate(layers_cfg):
         f"[Layer {idx}] colour={lay['color']}  samples={S} "
         f"(R={lay['grain_radius']}px σ={lay['grain_sigma']})"
     )
-    render(12345)
+    render(12345 + idx) # Use different seed per layer
     results.append(neg.to_numpy())
 
 
@@ -322,6 +312,9 @@ def linear_to_srgb(img: np.ndarray, g: float) -> np.ndarray:
 def downscale(np_img: np.ndarray) -> Image.Image:
     h = H_final
     w = round(np_img.shape[1] / SS)
+    # Ensure the output is 3-channel RGB for saving
+    if np_img.ndim == 2:
+        np_img = np.stack([np_img] * 3, axis=-1)
     srgb = np.clip(linear_to_srgb(np_img, args.gamma), 0, 1)
     return Image.fromarray((srgb * 255).astype(np.uint8)).resize((w, h), Image.LANCZOS)
 
@@ -330,20 +323,17 @@ def downscale(np_img: np.ndarray) -> Image.Image:
 out_path = Path(args.output)
 root, ext = out_path.stem, out_path.suffix or ".png"
 
-if len(results) == 1:
+if film_type == "BW":
+    # BW film has one layer, invert to get positive
     pos = 1.0 - results[0]
     downscale(pos).save(f"{root}{ext}")
-else:
-    neg_stack = np.stack(results, axis=-1)  # as-simulated order
-    # Re-order to proper RGB: map layer colour → position
-    rgb = np.zeros_like(neg_stack[..., :3])
-    for lay, img in zip(layers_cfg, results):
+else:  # film_type == "NEG"
+    # Create an empty RGB image to composite into
+    pos_rgb = np.zeros_like(img_lin)
+    # Map each simulated layer back to its designated RGB channel
+    for i, lay in enumerate(layers_cfg):
         col = lay["color"]
-        if col == "L":
-            rgb += img[..., None]  # monochrome contributes equally
-        else:
-            rgb[..., rgb_index[col]] = img
-    pos_rgb = 1.0 - rgb
+        pos_rgb[..., rgb_index[col]] = 1.0 - results[i]
     downscale(pos_rgb).save(f"{root}{ext}")
 
 print("[OK] saved →", f"{root}{ext}")
