@@ -25,8 +25,8 @@ grain_sigma = 0.00
 sigma_filter = 0.08
 
 [[film_base]]
-thickness = 1.0
+thickness = 20.0
 
 [[back]] 
-reflectance = 0.0 # if the anti_halation layer is present, the back of the film is not reflective at all
-# reflectance = 0.2  # else, the back of the film is reflective
+# reflectance = 0.0 # if the anti_halation layer is present, the back of the film is not reflective at all
+reflectance = 1.0  # else, the back of the film is reflective

@@ -1,18 +1,26 @@
-import argparse, math
+#!/usr/bin/env python3
+# ──────────────────────────────────────────────────────────────────────────────
+#  Colour-negative film-grain / thin-film path-tracer (Taichi + NumPy)
+#  – back reflection & hemispherical bounce –  (bug-fixed edition)
+# ──────────────────────────────────────────────────────────────────────────────
+import argparse, math, random
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
 import numpy as np
 from PIL import Image
 import taichi as ti, taichi.math as tm
 import tomllib as toml
 
-# ──────────────────────────── CLI ────────────────────────────────────────────
+# ────────────────────────────── CLI ───────────────────────────────────────────
 cli = argparse.ArgumentParser(description="Colour-negative film-grain emulator")
 cli.add_argument("--input", required=True, help="RGB input image")
 cli.add_argument("--height", type=int, default=1080, help="Output height (px)")
 cli.add_argument("--supersample", type=int, default=1, help="Over-sampling factor")
-cli.add_argument("--samples", type=int, default=100, help="# Monte-Carlo samples/px")
+cli.add_argument("--samples", type=int, default=100, help="# MC samples/px (grains)")
+cli.add_argument(
+    "--bounce_samples", type=int, default=10, help="# samples for back-bounce"
+)
 cli.add_argument("--gamma", type=float, default=2.2, help="sRGB γ")
 cli.add_argument(
     "--film_cfg", default="film-config.toml", help="TOML stock description"
@@ -20,32 +28,40 @@ cli.add_argument(
 cli.add_argument("--output", default="out.png", help="Destination file")
 args = cli.parse_args()
 
-# ────────────────────────── read TOML (preserve order) ───────────────────────
+# ─────────────────── read TOML while preserving block order ──────────────────
 cfg_txt = Path(args.film_cfg).read_text(encoding="utf8")
 
 order: List[Tuple[str, int]] = []
-seen = {"emulsion": 0, "filter": 0}
+seen = {"emulsion": 0, "filter": 0, "film_base": 0, "back": 0}
 for ln in cfg_txt.splitlines():
     ln = ln.strip()
-    if ln.startswith("[[emulsion]]"):
-        order.append(("emulsion", seen["emulsion"]))
-        seen["emulsion"] += 1
-    elif ln.startswith("[[filter]]"):
-        order.append(("filter", seen["filter"]))
-        seen["filter"] += 1
+    for key in ("emulsion", "filter", "film_base", "back"):
+        if ln.startswith(f"[[{key}]]"):
+            order.append((key, seen[key]))
+            seen[key] += 1
 
-raw_cfg: Dict = toml.loads(cfg_txt)
-emulsions: List[Dict] = raw_cfg.get("emulsion", [])
-filters: List[Dict] = raw_cfg.get("filter", [])
+cfg = toml.loads(cfg_txt)
+emulsions = cfg.get("emulsion", [])
+filters = cfg.get("filter", [])
+bases = cfg.get("film_base", [])
+backs = cfg.get("back", [])
 
 if not emulsions:
-    raise ValueError("At least one [[emulsion]] block is required")
+    raise ValueError("Need at least one [[emulsion]] block")
 if len(filters) not in {len(emulsions), len(emulsions) - 1}:
     raise ValueError("#[[filter]] must equal #[[emulsion]] or be one fewer")
 
-EPSILON = 1e-5
+if not bases:
+    bases.append({"thickness": 1.0})
+if not backs:
+    backs.append({"reflectance": 0.0})
+
+film_thick = float(bases[0].get("thickness", 1.0))
+back_refl = float(backs[0].get("reflectance", 0.0))
+EPS = 1e-5
 
 
+# ───────────────────── colour-space helpers ───────────────────────────────────
 def srgb_to_linear(arr, g):
     arr = arr / 255.0
     return np.where(arr <= 0.04045, arr / 12.92, ((arr + 0.055) / 1.055) ** g).astype(
@@ -57,9 +73,10 @@ def linear_to_srgb(arr, g):
     return np.where(arr <= 0.0031308, arr * 12.92, 1.055 * arr ** (1.0 / g) - 0.055)
 
 
+# ─────────────────────────── initialise Taichi ───────────────────────────────
 ti.init(arch=ti.gpu, default_ip=ti.i32, random_seed=0)
 
-# ─────────────────────────── load input ───────────────────────────────────────
+# ─────────────────────────── load & resize input ─────────────────────────────
 pil_in = Image.open(args.input).convert("RGB")
 H_sim = args.height * args.supersample
 W_sim = round(pil_in.width * H_sim / pil_in.height)
@@ -68,7 +85,7 @@ img_lin = srgb_to_linear(
     args.gamma,
 )
 
-# ─────────────────── Taichi fields & uniforms ────────────────────────────────
+# ────────────────────────── Taichi fields (grain sim) ────────────────────────
 src_tex = ti.field(ti.f32, shape=(H_sim, W_sim))
 neg = ti.field(ti.f32, shape=(H_sim, W_sim))
 
@@ -77,7 +94,7 @@ sigma_ln_f, mu_ln_f, maxR_f = (ti.field(ti.f32, shape=()) for _ in range(3))
 lambda_fac_f, ag_f = (ti.field(ti.f32, shape=()) for _ in range(2))
 
 
-# ─────────────────── random helpers and kernel ───────────────────────────────
+# ─────────────────── random helpers for kernels ──────────────────────────────
 @ti.func
 def wang(seed: ti.u32) -> ti.u32:
     seed = (seed ^ 61) ^ (seed >> 16)
@@ -103,7 +120,7 @@ class Rnd:
 
 
 @ti.func
-def rnd01(state):  # [0,1)
+def rnd01(state):
     ns = xor_shift(state)
     return Rnd(ns, ns * (1.0 / 4294967295.0))
 
@@ -136,8 +153,9 @@ def sq(a, b, c, d):
     return (a - c) * (a - c) + (b - d) * (b - d)
 
 
+# ─────────────────────── grain kernel ────────────────────────────────────────
 @ti.kernel
-def render(seed: ti.u32):
+def render(seed: ti.u32, n_samples: ti.i32):
     fseed = wang(seed)
     SIG = SIG_f[None]
     SIG_F = SIGF_f[None]
@@ -151,7 +169,7 @@ def render(seed: ti.u32):
     for py, px in neg:
         st = wang(ti.u32(py * 73856093 ^ px * 19349663 ^ fseed))
         hit = 0.0
-        for _ in range(args.samples):
+        for _ in range(n_samples):
             g1 = rnd_gauss(st)
             st = g1.s
             g2 = rnd_gauss(st)
@@ -161,7 +179,7 @@ def render(seed: ti.u32):
             ix = ti.cast(tm.clamp(ti.floor(xG), 0, W_sim - 1), ti.i32)
             iy = ti.cast(tm.clamp(ti.floor(yG), 0, H_sim - 1), ti.i32)
 
-            u = tm.clamp(src_tex[iy, ix], 0.0, 1.0 - EPSILON)
+            u = tm.clamp(src_tex[iy, ix], 0.0, 1.0 - EPS)
             lam = -λ_fac * ti.log(1.0 - u)
             exL = ti.exp(-lam)
 
@@ -185,6 +203,7 @@ def render(seed: ti.u32):
                         cs = rv.s
                         xc = ag * (ti.cast(cx, ti.f32) + ru.v)
                         yc = ag * (ti.cast(cy, ti.f32) + rv.v)
+
                         r2 = R2
                         if SIG > 0:
                             rg = rnd_gauss(cs)
@@ -197,10 +216,10 @@ def render(seed: ti.u32):
                     cy += 1
                 cx += 1
             hit += 1.0 if covered else 0.0
-        neg[py, px] = 1.0 - hit / args.samples  # 1 → clear, 0 → opaque
+        neg[py, px] = 1.0 - hit / n_samples  # 1→clear, 0→opaque
 
 
-# ───────────────── grain-physics helper ───────────────────────────────────────
+# ───────────────── physics parameter packing helper ───────────────────────────
 def prep_physics(r_px, sig_px, sig_filter_px):
     R_f[None] = r_px
     SIG_f[None] = sig_px
@@ -208,11 +227,12 @@ def prep_physics(r_px, sig_px, sig_filter_px):
     R2_f[None] = r_px * r_px
 
     if sig_px == 0:
-        sigma_ln = sigma2_ln = 0.0
+        sigma2_ln = sigma_ln = 0.0
     else:
         sigma2_ln = math.log((sig_px / r_px) ** 2 + 1)
         sigma_ln = math.sqrt(sigma2_ln)
-    sigma_ln_f[None], mu_ln_f[None] = sigma_ln, math.log(r_px) - 0.5 * sigma2_ln
+    sigma_ln_f[None] = sigma_ln
+    mu_ln_f[None] = math.log(r_px) - 0.5 * sigma2_ln
 
     maxR_f[None] = r_px if sig_px == 0 else math.exp(mu_ln_f[None] + 3.0902 * sigma_ln)
     ag = 1.0 / math.ceil(1.0 / r_px) if r_px > 0 else 1.0
@@ -222,24 +242,18 @@ def prep_physics(r_px, sig_px, sig_filter_px):
     )
 
 
-# ───────────────────────── simulation loop ───────────────────────────────────
-ray = img_lin.copy()  # through-going light
-results: List[Tuple[np.ndarray, np.ndarray]] = []  # (absorption-weights, density)
+# ─────────────────────────── front-to-back pass ──────────────────────────────
+ray_front = img_lin.copy()
+layer_absorbs: List[np.ndarray] = []
+layer_dens: List[np.ndarray] = []
 
+print()
 for idx, (kind, k) in enumerate(order):
     if kind == "emulsion":
         emu = emulsions[k]
-        dye = np.array(emu["sensitising_dye_color"], dtype=np.float32) / 255.0
-
-        # absorption weights: complement of the dye colour, normalised
-        absorb = 1.0 - dye
-        if absorb.sum() < EPSILON:
-            raise ValueError("Sensitising dye colour must not be pure white")
-        # normalization
-        absorb = absorb / absorb.sum()
-
-        # exposure: luminance seen through the absorption spectrum
-        src = 1.0 - np.clip(np.tensordot(ray, absorb, axes=([-1], [0])), 0.0, 1.0)
+        dye = np.array(emu["sensitising_dye_color"], np.float32) / 255.0
+        absorb = (1.0 - dye) / (1.0 - dye).sum()
+        src = 1.0 - np.clip(np.tensordot(ray_front, absorb, axes=([-1], [0])), 0.0, 1.0)
         src_tex.from_numpy(src.astype(np.float32))
 
         r_px = emu.get("grain_radius", 0.02) * args.supersample
@@ -248,34 +262,92 @@ for idx, (kind, k) in enumerate(order):
         prep_physics(r_px, sig_px, sig_f)
 
         print(
-            f"[emu {idx}] dye={emu['sensitising_dye_color']}  "
-            f"R={r_px/args.supersample:.3f}px σ={sig_px/args.supersample:.3f}px"
+            f"[emu {idx}] dye={emu['sensitising_dye_color']}  R={r_px/args.supersample:.3f}px σ={sig_px/args.supersample:.3f}px"
         )
-        render(12345)
-        developed_negative = neg.to_numpy()
-        results.append((absorb, developed_negative))
+        render(12345 + idx * 19, args.samples)
+        dens = neg.to_numpy()
+        layer_absorbs.append(absorb)
+        layer_dens.append(dens)
 
-        # attenuate spectral components for deeper layers
-        #   factor = 1 - w*(1 - density)
-        ray *= 1.0 - absorb[None, None, :] * (1.0 - developed_negative[..., None])
-    else:  # filter
-        fil = filters[k]
-        fcol = np.array(fil["color"], dtype=np.float32) / 255.0
-        ray *= fcol[None, None, :]
-        print(f"[filter {idx}] colour={fil['color']}")
+        ray_front *= 1.0 - absorb[None, None, :] * (1.0 - dens[..., None])
 
-# ───────────────────────── assemble final negative ───────────────────────────
-pos_rgb = np.ones_like(img_lin)
-for absorb, density in results:
-    layer = 1.0 - absorb[None, None, :] + absorb[None, None, :] * density[..., None]
-    pos_rgb *= layer  # successive dye layers multiply
+    elif kind == "filter":
+        col = np.array(filters[k]["color"], np.float32) / 255.0
+        ray_front *= col[None, None, :]
+        print(f"[filter {idx}] colour={filters[k]['color']}")
+    elif kind == "film_base":
+        print(f"[base] thickness={film_thick}")
+    elif kind == "back":
+        print(f"[back] reflectance={back_refl}")
 
-# ───────────────────────── down-scale & save ─────────────────────────────────
-out = linear_to_srgb(pos_rgb, args.gamma)
-out = np.clip(out, 0, 1)
-out = Image.fromarray((out * 255).astype(np.uint8)).resize(
+# light transmitted in forward direction (no bounce)
+front_rgb = np.ones_like(img_lin)
+for absorb, dens in zip(layer_absorbs, layer_dens):
+    front_rgb *= 1.0 - absorb[None, None, :] + absorb[None, None, :] * dens[..., None]
+
+# ───────────────────────── back-bounce Monte-Carlo ───────────────────────────
+if back_refl > EPS:
+    print(f"\n[+] simulating back-bounce with {args.bounce_samples} samples/px …")
+    H, W = H_sim, W_sim
+    S = args.bounce_samples
+    film_px = film_thick * args.supersample
+    rev_abs = layer_absorbs[::-1]
+    rev_dens = layer_dens[::-1]
+
+    ys, xs = np.mgrid[0:H, 0:W]
+    out_rgb = np.zeros((H, W, 3), np.float32)
+    rng = np.random.default_rng(42)
+
+    for _ in range(S):
+        u1 = rng.random((H, W), np.float32)
+        u2 = rng.random((H, W), np.float32)
+        z = np.sqrt(u1)
+        valid_z = z > 1e-4
+
+        r = np.sqrt(1.0 - z * z)
+        phi = 2.0 * math.pi * u2
+        dir_x = r * np.cos(phi)
+        dir_y = r * np.sin(phi)
+
+        shift_x = np.zeros_like(z)
+        shift_y = np.zeros_like(z)
+        shift_x[valid_z] = (dir_x[valid_z] / z[valid_z]) * film_px
+        shift_y[valid_z] = (dir_y[valid_z] / z[valid_z]) * film_px
+
+        x2 = xs + shift_x
+        y2 = ys + shift_y
+        x2i = x2.astype(np.int32, copy=False)
+        y2i = y2.astype(np.int32, copy=False)
+
+        valid = valid_z & (x2i >= 0) & (x2i < W) & (y2i >= 0) & (y2i < H)
+
+        # ──── MOD #1: black default (fix bright border) ────────────────────
+        bounced = np.zeros((H, W, 3), np.float32)
+
+        if valid.any():
+            yy, xx = np.where(valid)
+
+            # ──── MOD #2: only spectrum that already passed down ───────────
+            col = front_rgb[y2i[yy, xx], x2i[yy, xx]].copy()
+
+            for absorb, dens in zip(rev_abs, rev_dens):
+                dv = dens[y2i[yy, xx], x2i[yy, xx]][:, None]
+                col *= 1.0 - absorb + absorb * dv
+
+            bounced[yy, xx] = col
+
+        out_rgb += bounced
+
+    bounced_rgb = out_rgb / S
+    # ──── MOD #3: add bounce, do not mix (brighter exposure) ───────────────
+    final_rgb = np.clip(front_rgb + bounced_rgb * back_refl, 0.0, 1.0)
+else:
+    final_rgb = front_rgb
+
+# ─────────────────────── down-sample & save ──────────────────────────────────
+out = linear_to_srgb(final_rgb, args.gamma)
+out_img = Image.fromarray((out * 255).astype(np.uint8)).resize(
     (round(W_sim / args.supersample), args.height), Image.LANCZOS
 )
-out_path = Path(args.output)
-out.save(out_path)
-print("[OK] saved →", out_path)
+out_img.save(Path(args.output))
+print("\n[OK] saved →", args.output)
