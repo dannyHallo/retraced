@@ -1,11 +1,3 @@
-#!/usr/bin/env python3
-# retraced.py ──────────────────────────────────────────────────────────
-#  B&W and 3-layer colour film grain with optional supersampling
-#  Grain parameters are now decoupled from output resolution.
-# ----------------------------------------------------------------------
-# 2025 © Ruitian Yang - MIT License
-# ----------------------------------------------------------------------
-
 import math, argparse
 from pathlib import Path
 from typing import List
@@ -244,9 +236,6 @@ def downscale(np_img: np.ndarray) -> Image.Image:
     """Resize from simulation to final resolution with Lanczos."""
     h = H_final
     w = round(np_img.shape[1] / SS)
-    # return Image.fromarray((np_img * 255).astype(np.uint8)).resize(
-    #     (w, h), Image.LANCZOS
-    # )
     g = args.gamma
     srgb = np.where(
         np_img <= 0.0031308, np_img * 12.92, 1.055 * np.power(np_img, 1 / g) - 0.055
