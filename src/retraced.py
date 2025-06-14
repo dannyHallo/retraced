@@ -18,8 +18,8 @@ cli = argparse.ArgumentParser(description="Colour-negative film-grain emulator")
 cli.add_argument("--input", required=True)
 cli.add_argument("--height", type=int, default=1080)
 cli.add_argument("--supersample", type=int, default=1)
-cli.add_argument("--samples", type=int, default=200)
-cli.add_argument("--bounce_samples", type=int, default=200)
+cli.add_argument("--samples", type=int, default=400)
+cli.add_argument("--bounce_samples", type=int, default=400)
 cli.add_argument("--gamma", type=float, default=2.2)
 cli.add_argument("--film_cfg", default="film-config.toml")
 cli.add_argument("--output", default="out.png")
@@ -86,11 +86,12 @@ img_lin = srgb_to_linear(
 
 # ─────────────── Taichi fields for grain simulation ──────────────────────────
 src_tex = ti.field(ti.f32, shape=(H_sim, W_sim))  # scene luminance for exposure
-neg = ti.field(ti.f32, shape=(H_sim, W_sim))      # 1→clear, 0→opaque
+neg = ti.field(ti.f32, shape=(H_sim, W_sim))  # 1→clear, 0→opaque
 
 R_f, SIG_f, SIGF_f, R2_f = (ti.field(ti.f32, shape=()) for _ in range(4))
 sigma_ln_f, mu_ln_f, maxR_f = (ti.field(ti.f32, shape=()) for _ in range(3))
 lambda_fac_f, ag_f = (ti.field(ti.f32, shape=()) for _ in range(2))
+
 
 # ────────────────────── RNG helpers (Wang & XOR-shift) ───────────────────────
 @ti.func
