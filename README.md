@@ -4,9 +4,10 @@
 
 **Retraced** (working title “CyberFilm”) is an open-source, Taichi-accelerated simulator that recreates the look & feel of silver-halide emulsions — and soon color films — purely in software.
 
-| Input                      | Retraced                    |
-| -------------------------- | --------------------------- |
-| ![alt text](img/input.jpg) | ![alt text](img/output.png) |
+| Input                               | Retraced                             |
+| ----------------------------------- | ------------------------------------ |
+| ![alt text](img/input.jpg)          | ![alt text](img/output.png)          |
+| ![alt text](img/input-colorful.jpg) | ![alt text](img/output-colorful.png) |
 
 ---
 

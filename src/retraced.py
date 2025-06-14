@@ -1,11 +1,3 @@
-#!/usr/bin/env python3
-# ──────────────────────────────────────────────────────────────────────────────
-#  Colour-negative film-grain / thin-film path-tracer (Taichi + NumPy, GPU)
-# ──────────────────────────────────────────────────────────────────────────────
-#  * Minimal functional changes *
-#      ❶-❹ : keep halo-parallax fix from previous answer
-#      ❺-❻ : add the “post-stack” diagnostic lines the user asked for
-# ──────────────────────────────────────────────────────────────────────────────
 import argparse, math
 from pathlib import Path
 from typing import List, Tuple

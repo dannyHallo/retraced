@@ -4,7 +4,7 @@
     "activate env": "conda activate retraced-demo",
     "install requirements": "pip install -r requirements.txt",
     "feed gpt": "python gpt-feeder/feeder.py --root ./ --ignore ./.git/ ./gpt-feeder/ LICENSE .gitmodules",
-    "retraced": "python src/retraced.py --input test-imgs/sunset-digi.jpg --film_cfg film-config.toml --height 2421 --supersample 1",
+    "retraced": "python src/retraced.py --input test-imgs/sunset-digi.jpg --film_cfg film-config.toml --height 2421",
     "scanner": "python src/scanner.py"
   },
   "python.analysis.diagnosticSeverityOverrides": {

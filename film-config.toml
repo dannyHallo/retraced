@@ -2,7 +2,7 @@ type = "NEG"
 
 [[emulsion]] # blue layer
 sensitising_dye_color = [255, 255, 0] # since yellow dye absorbs blue light
-grain_radius = 0.02
+grain_radius = 0.04
 grain_sigma = 0.00
 sigma_filter = 0.08
 
@@ -11,7 +11,7 @@ color = [255, 255, 0] # block the blue light from passing through
 
 [[emulsion]] # green layer
 sensitising_dye_color = [255, 0, 255] # since magenta dye absorbs green light
-grain_radius = 0.02
+grain_radius = 0.04
 grain_sigma = 0.00
 sigma_filter = 0.08
 
@@ -20,7 +20,7 @@ color = [255, 0, 255] # block the green light from passing through
 
 [[emulsion]] # red layer
 sensitising_dye_color = [0, 255, 255] # since cyan dye absorbs red light
-grain_radius = 0.02
+grain_radius = 0.04
 grain_sigma = 0.00
 sigma_filter = 0.08
 
@@ -29,4 +29,4 @@ thickness = 20.0
 
 [[back]] 
 # reflectance = 0.0 # if the anti_halation layer is present, the back of the film is not reflective at all
-reflectance = 1.0  # else, the back of the film is reflective
+reflectance = 0.8  # else, the back of the film is reflective
