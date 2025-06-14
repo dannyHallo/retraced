@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 # retraced.py ──────────────────────────────────────────────────────────
-#  B&W + 3-layer colour film grain with optional supersampling
-#  © 2025 Ruitian Yang  - MIT License
-# ---------------------------------------------------------------------
+#  B&W and 3-layer colour film grain with optional supersampling
+#  Grain parameters are now decoupled from output resolution.
+# ----------------------------------------------------------------------
+# 2025 © Ruitian Yang - MIT License
+# ----------------------------------------------------------------------
+
 import math, argparse
 from pathlib import Path
 from typing import List
@@ -14,65 +17,94 @@ import taichi.math as tm
 
 # ───────────────────────── CLI ────────────────────────────────────────
 cli = argparse.ArgumentParser(description="Physically-based film-grain emulator")
-cli.add_argument("--input", required=True, help="Input image")
 
-cli.add_argument("--height", type=int, default=1080, help="Final image height")
-cli.add_argument("--supersample", type=int, default=1, help="Supersampling factor")
+cli.add_argument("--input", required=True, help="Input image")
+cli.add_argument("--height", type=int, default=1080, help="Height of FINAL image (px)")
+
 cli.add_argument(
-    "--grain_radius", type=float, default=1.25, help="Mean grain radius (px)"
+    "--supersample",
+    type=int,
+    default=1,
+    help="Oversampling factor (render at height*SS, then downscale)",
+)
+
+cli.add_argument(
+    "--gamma", type=float, default=2.2, help="Electro-optical transfer γ (2.2 ≈ sRGB)"
+)
+
+# ❶  Grain parameters are given in *final* pixels
+cli.add_argument(
+    "--grain_radius",
+    type=float,
+    default=1.25,
+    help="Mean grain radius, in final-image pixels",
 )
 cli.add_argument(
-    "--grain_sigma", type=float, default=0.40, help="σ of log-normal radius"
+    "--grain_sigma",
+    type=float,
+    default=0.40,
+    help="σ of log-normal radius, in final-image pixels",
 )
-cli.add_argument("--sigma_filter", type=float, default=0.8, help="AA jitter σ (px)")
-cli.add_argument("--lambda_scale", type=float, default=3.0, help="Exposure scaling")
+cli.add_argument(
+    "--sigma_filter", type=float, default=0.8, help="AA jitter σ, in final-image pixels"
+)
+
 cli.add_argument("--samples", type=int, default=100, help="# Monte-Carlo samples")
+
 cli.add_argument(
     "--color", action="store_true", help="Enable three-layer colour negative (B→G→R)"
 )
+
 cli.add_argument("--output", default="out.png", help="Output filename")
 args = cli.parse_args()
 
-# Derived sizes --------------------------------------------------------
+# ───────────────────── Derived sizes ──────────────────────────────────
 SS = max(1, args.supersample)
 H_final = args.height
-H_sim = H_final * SS  # simulation (oversample) height
+H_sim = H_final * SS  # off-screen height
 
-# ─────────────────────── Init Taichi ──────────────────────────────────
+# ⟹ convert film parameters from final-px to simulation-px
+R_px = args.grain_radius * SS
+SIG_px = args.grain_sigma * SS
+SIG_F = args.sigma_filter * SS
+
+# ───────────────────── Init Taichi ────────────────────────────────────
 ti.init(arch=ti.gpu, default_ip=ti.i32, random_seed=0)
 print("[Taichi] arch:", ti.cfg.arch)
 
 
-# ──────────────────── Helper: prepare sources ─────────────────────────
-def load_and_resize(im: Image.Image, height: int) -> np.ndarray:
-    h = height
-    w = round(im.width * h / im.height)
-    return np.asarray(im.resize((w, h), Image.LANCZOS), np.float32) * (1 / 255)
+# ─────── Helper: load channels & resize to simulation size ────────────
+def load_resized(im: Image.Image, height: int) -> np.ndarray:
+    w = round(im.width * height / im.height)
+    # --- sRGB → linear ------------------------------------------------
+    srgb = np.asarray(im.resize((w, height), Image.LANCZOS), np.float32) * (1 / 255)
+    g = args.gamma
+    lin = np.where(srgb <= 0.04045, srgb / 12.92, np.power((srgb + 0.055) / 1.055, g))
+    return lin.astype(np.float32)
 
 
 pil_in = Image.open(args.input)
 
 if args.color:
     pil_in = pil_in.convert("RGB")
-    src_channels: List[np.ndarray] = [
-        load_and_resize(pil_in.getchannel(ch), H_sim)  # B, G, R order
+    src_layers: List[np.ndarray] = [
+        load_resized(pil_in.getchannel(ch), H_sim)  # B, G, R order
         for ch in ("B", "G", "R")
     ]
 else:
     pil_in = pil_in.convert("L")
-    src_channels = [load_and_resize(pil_in, H_sim)]
+    src_layers = [load_resized(pil_in, H_sim)]
 
-H, W = src_channels[0].shape
-print(f"[Info] simulation size {W}×{H}  (SS×{SS})")
+H, W = src_layers[0].shape
+print(f"[Info] simulation size: {W}×{H}  (SS×{SS})")
 
-# ───────────────────────── Fields & consts ────────────────────────────
+# ──────────────── Taichi fields & physical constants ─────────────────
 src_tex = ti.field(ti.f32, shape=(H, W))
 neg = ti.field(ti.f32, shape=(H, W))
 
 S = args.samples
-R, SIG = args.grain_radius, args.grain_sigma
-SIG_F = args.sigma_filter
-uMax, π = 2.0, math.pi
+R, SIG = R_px, SIG_px  # now *simulation* pixels
+uMax, π = 1.0, math.pi
 ag = 1.0 / math.ceil(1.0 / R)
 R2 = R * R
 sigma2_ln = 0.0 if SIG == 0 else math.log((SIG / R) ** 2 + 1)
@@ -80,12 +112,11 @@ sigma_ln = math.sqrt(sigma2_ln) if SIG > 0 else 0.0
 mu_ln = math.log(R) - 0.5 * sigma2_ln
 maxR = R if SIG == 0 else math.exp(mu_ln + 3.0902 * sigma_ln)
 λ_fac = ag * ag / (π * (R2 + SIG * SIG))
-λ_scale = args.lambda_scale
 eps = 1e-5
 U32 = ti.u32
 
 
-# ───────────────────────── RNG helpers ────────────────────────────────
+# ────────────────────────── RNG helpers ──────────────────────────────
 @ti.func
 def wang(seed: U32) -> U32:
     seed = (seed ^ 61) ^ (seed >> 16)
@@ -113,7 +144,7 @@ class Rnd:
 @ti.func
 def rnd01(state: U32) -> Rnd:
     ns = xor_shift(state)
-    return Rnd(ns, ns * (1.0 / 4294967295.0))
+    return Rnd(ns, ns * (1 / 4294967295.0))
 
 
 @ti.func
@@ -142,7 +173,7 @@ def sq(a, b, c, d):
     return (a - c) * (a - c) + (b - d) * (b - d)
 
 
-# ─────────────────────────── Kernel ───────────────────────────────────
+# ────────────────────────── Render kernel ────────────────────────────
 @ti.kernel
 def render(seed: U32):
     fseed = wang(seed)
@@ -156,11 +187,12 @@ def render(seed: U32):
             st = g2.s
             xG = ti.cast(px, ti.f32) + SIG_F * g1.v
             yG = ti.cast(py, ti.f32) + SIG_F * g2.v
-            ix = ti.cast(tm.clamp(ti.floor(xG), 0.0, W - 1.0), ti.i32)
-            iy = ti.cast(tm.clamp(ti.floor(yG), 0.0, H - 1.0), ti.i32)
+            ix = ti.cast(tm.clamp(ti.floor(xG), 0, W - 1), ti.i32)
+            iy = ti.cast(tm.clamp(ti.floor(yG), 0, H - 1), ti.i32)
 
-            u = src_tex[iy, ix] / (uMax + eps)
-            lam = λ_scale * (-λ_fac * ti.log(1.0 - u))
+            u = tm.clamp(src_tex[iy, ix], 0.0, uMax - eps)
+            lam = -λ_fac * ti.log(1.0 - u)
+
             exL = ti.exp(-lam)
 
             minX = ti.cast(ti.floor((xG - maxR) / ag), ti.i32)
@@ -176,7 +208,6 @@ def render(seed: U32):
                     cs = wang(U32((cy & 0xFFFF) << 16 | (cx & 0xFFFF)) + fseed)
                     rP = rnd_poisson(cs, lam, exL)
                     cs = rP.s
-                    # don't use underscore here, because it will collide with the underscore defined before, said by Taichi
                     for z in range(ti.cast(rP.v, ti.i32)):
                         ru = rnd01(cs)
                         cs = ru.s
@@ -199,36 +230,42 @@ def render(seed: U32):
         neg[py, px] = 1.0 - hit / S
 
 
-# ───────────────────────── Simulation ────────────────────────────────
+# ───────────────────── Render all layers ─────────────────────────────
 results: List[np.ndarray] = []
-for layer, chan_np in enumerate(src_channels):  # B → G → R
-    src_tex.from_numpy(chan_np)
+for layer, chan in enumerate(src_layers):  # B → G → R
+    src_tex.from_numpy(chan)
     print(f"[Layer {layer}] samples={S}")
-    render(12345)
-    results.append(neg.to_numpy())  # pull to CPU
+    render(12345)  # shared RNG for neutral grain
+    results.append(neg.to_numpy())
 
-# ───────────────────────── Down-sampling ─────────────────────────────
+
+# ───────────────────── Down-scale helper ──────────────────────────────
+def downscale(np_img: np.ndarray) -> Image.Image:
+    """Resize from simulation to final resolution with Lanczos."""
+    h = H_final
+    w = round(np_img.shape[1] / SS)
+    # return Image.fromarray((np_img * 255).astype(np.uint8)).resize(
+    #     (w, h), Image.LANCZOS
+    # )
+    g = args.gamma
+    srgb = np.where(
+        np_img <= 0.0031308, np_img * 12.92, 1.055 * np.power(np_img, 1 / g) - 0.055
+    )
+    srgb = np.clip(srgb, 0, 1)
+    return Image.fromarray((srgb * 255).astype(np.uint8)).resize((w, h), Image.LANCZOS)
+
+
+# ───────────────────── Save final images ──────────────────────────────
 root = Path(args.output).stem
 ext = Path(args.output).suffix or ".png"
 
-
-def downscale(img_np: np.ndarray) -> Image.Image:
-    """Lanczos resize from simulation to final size."""
-    h_out = H_final
-    w_out = round(img_np.shape[1] / SS)
-    pil = Image.fromarray((img_np * 255).astype(np.uint8))
-    return pil.resize((w_out, h_out), Image.LANCZOS)
-
-
 if args.color:
-    neg_bgr = np.stack(results, axis=-1)  # B, G, R
-    neg_rgb = neg_bgr[..., ::-1]  # R, G, B
+    neg_bgr = np.stack(results, axis=-1)
+    neg_rgb = neg_bgr[..., ::-1]
     pos_rgb = 1.0 - neg_rgb
-
     downscale(pos_rgb).save(f"{root}{ext}")
 else:
-    neg_np = results[0]
-    pos_np = 1.0 - neg_np
+    pos_np = 1.0 - results[0]
     downscale(pos_np).save(f"{root}{ext}")
 
 print("[OK] saved →", f"{root}{ext}")

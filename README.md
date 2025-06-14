@@ -112,5 +112,8 @@ MIT © 2025 Ruitian Yang 杨瑞天
 
 [Image Resources](https://www.pexels.com/search/4k/)
 
+[ADVANCED EMULSION: Silver Halide Crystals, Imaging Couplers, Orange Masks and Processing](https://www.youtube.com/watch?v=I4_7tW-cx1I)
+
 [Film grain rendering](https://www.youtube.com/watch?v=Gj4p5cocebc)
+
 [Shadertoy - Realistic Film Grain Rendering](https://www.shadertoy.com/view/lcXyR4)
