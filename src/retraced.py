@@ -1,146 +1,85 @@
-import argparse
-import math
+import argparse, math
 from pathlib import Path
-from typing import List, Dict
+from typing import Dict, List, Tuple
 
 import numpy as np
 from PIL import Image
-import taichi as ti
-import taichi.math as tm
+import taichi as ti, taichi.math as tm
 import tomllib as toml
 
-# ──────────────────────────────── CLI ─────────────────────────────────────────
-cli = argparse.ArgumentParser(description="Physically-based film-grain emulator")
-
-cli.add_argument("--input", required=True, help="RGB input image (anything PIL reads)")
-cli.add_argument("--height", type=int, default=1080, help="Final image height (px)")
+# ──────────────────────────── CLI ────────────────────────────────────────────
+cli = argparse.ArgumentParser(description="Colour-negative film-grain emulator")
+cli.add_argument("--input", required=True, help="RGB input image")
+cli.add_argument("--height", type=int, default=1080, help="Output height (px)")
+cli.add_argument("--supersample", type=int, default=1, help="Over-sampling factor")
+cli.add_argument("--samples", type=int, default=100, help="# Monte-Carlo samples/px")
+cli.add_argument("--gamma", type=float, default=2.2, help="sRGB γ")
 cli.add_argument(
-    "--supersample",
-    type=int,
-    default=1,
-    help="Oversampling factor (render at height×SS then downscale)",
-)
-cli.add_argument(
-    "--samples", type=int, default=100, help="# Monte-Carlo samples per output pixel"
-)
-cli.add_argument(
-    "--gamma", type=float, default=2.2, help="Electro-optical transfer γ (sRGB ≈ 2.2)"
-)
-cli.add_argument(
-    "--film_cfg",
-    default="film-config.toml",
-    help="TOML file that describes the film stock",
+    "--film_cfg", default="film-config.toml", help="TOML stock description"
 )
 cli.add_argument("--output", default="out.png", help="Destination file")
 args = cli.parse_args()
 
-# ─────────────────────────── Read film-config ────────────────────────────────
-cfg: Dict = toml.loads(Path(args.film_cfg).read_text())
+# ────────────────────────── read TOML (preserve order) ───────────────────────
+cfg_txt = Path(args.film_cfg).read_text(encoding="utf8")
 
-# Differentiate film type at the highest level
-film_type = cfg.get("type", "").upper()
-if film_type not in ("BW", "NEG"):
-    raise ValueError("film-config.toml must specify type: 'BW' or 'NEG'")
+order: List[Tuple[str, int]] = []
+seen = {"emulsion": 0, "filter": 0}
+for ln in cfg_txt.splitlines():
+    ln = ln.strip()
+    if ln.startswith("[[emulsion]]"):
+        order.append(("emulsion", seen["emulsion"]))
+        seen["emulsion"] += 1
+    elif ln.startswith("[[filter]]"):
+        order.append(("filter", seen["filter"]))
+        seen["filter"] += 1
 
-layers_cfg: List[Dict] = cfg.get("layer", [])
-if not layers_cfg:
-    raise ValueError("film-config.toml must contain at least one [[layer]]")
+raw_cfg: Dict = toml.loads(cfg_txt)
+emulsions: List[Dict] = raw_cfg.get("emulsion", [])
+filters: List[Dict] = raw_cfg.get("filter", [])
 
-# Validate layers based on film type
-if film_type == "BW" and len(layers_cfg) != 1:
-    raise ValueError("Film type 'BW' requires exactly one [[layer]].")
+if not emulsions:
+    raise ValueError("At least one [[emulsion]] block is required")
+if len(filters) not in {len(emulsions), len(emulsions) - 1}:
+    raise ValueError("#[[filter]] must equal #[[emulsion]] or be one fewer")
 
-valid_colors_neg = {"R", "G", "B"}
-for i, lay in enumerate(layers_cfg):
-    colour = str(lay.get("color", "")).upper()
-    if film_type == "BW":
-        if colour != "L":
-            raise ValueError(f"Layer {i}: BW film layers must have color = 'L'")
-    elif film_type == "NEG":
-        if colour not in valid_colors_neg:
-            raise ValueError(
-                f"Layer {i}: NEG film layers must have color 'R', 'G', or 'B', not '{colour}'"
-            )
-    lay["color"] = colour
-
-    # --- numerical defaults ----------------------------------------------------
-    lay.setdefault("grain_radius", 1.25)
-    lay.setdefault("grain_sigma", 0.40)
-    lay.setdefault("sigma_filter", 0.80)
-
-# ──────────────────────── Derived global sizes ───────────────────────────────
-SS = max(1, args.supersample)  # supersampling factor
-H_final = args.height
-H_sim = H_final * SS  # off-screen buffer height
-
-# ───────────────────────────── Init Taichi ────────────────────────────────────
-ti.init(arch=ti.gpu, default_ip=ti.i32, random_seed=0)
-print("[Taichi] backend:", ti.cfg.arch)
+EPSILON = 1e-5
 
 
-# ─────────────────────── Load & linearise input image ─────────────────────────
-def srgb_to_linear(arr: np.ndarray, g: float) -> np.ndarray:
-    arr = arr * (1 / 255)
+def srgb_to_linear(arr, g):
+    arr = arr / 255.0
     return np.where(arr <= 0.04045, arr / 12.92, ((arr + 0.055) / 1.055) ** g).astype(
         np.float32
     )
 
 
-pil_in = Image.open(args.input).convert("RGB")  # RGB guaranteed
+def linear_to_srgb(arr, g):
+    return np.where(arr <= 0.0031308, arr * 12.92, 1.055 * arr ** (1.0 / g) - 0.055)
+
+
+ti.init(arch=ti.gpu, default_ip=ti.i32, random_seed=0)
+
+# ─────────────────────────── load input ───────────────────────────────────────
+pil_in = Image.open(args.input).convert("RGB")
+H_sim = args.height * args.supersample
 W_sim = round(pil_in.width * H_sim / pil_in.height)
 img_lin = srgb_to_linear(
-    np.asarray(pil_in.resize((W_sim, H_sim), Image.LANCZOS), np.float32),
+    np.asarray(pil_in.resize((W_sim, H_sim), Image.LANCZOS), dtype=np.float32),
     args.gamma,
-)  # (H, W, 3) RGB-linear
-H_sim, W_sim, _ = img_lin.shape
-print(f"[Info] simulation size: {W_sim}×{H_sim}  (SS×{SS})")
+)
 
-# ────────────────────── Helper: create per-layer source ───────────────────────
-rgb_index = {"R": 0, "G": 1, "B": 2}
+# ─────────────────── Taichi fields & uniforms ────────────────────────────────
+src_tex = ti.field(ti.f32, shape=(H_sim, W_sim))
+neg = ti.field(ti.f32, shape=(H_sim, W_sim))
 
-
-def luminance(rgb: np.ndarray) -> np.ndarray:
-    # Rec. 709 luma coeffs
-    return (0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]).astype(
-        np.float32
-    )
+R_f, SIG_f, SIGF_f, R2_f = (ti.field(ti.f32, shape=()) for _ in range(4))
+sigma_ln_f, mu_ln_f, maxR_f = (ti.field(ti.f32, shape=()) for _ in range(3))
+lambda_fac_f, ag_f = (ti.field(ti.f32, shape=()) for _ in range(2))
 
 
-src_layers: List[np.ndarray] = []
-for i, lay in enumerate(layers_cfg):
-    colour = lay["color"]
-    if colour == "L":
-        src = luminance(img_lin)
-    else:  # 'R', 'G', or 'B'
-        src = img_lin[..., rgb_index[colour]].astype(np.float32)
-    src_layers.append(src)
-
-# ───────────────────────── Taichi fields & buffers ────────────────────────────
-src_tex = ti.field(dtype=ti.f32, shape=(H_sim, W_sim))  # current layer source
-neg = ti.field(dtype=ti.f32, shape=(H_sim, W_sim))  # rendered negative layer
-
-# per-layer physical parameters -- scalar 0-D Taichi fields (cheap to update)
-R_f = ti.field(dtype=ti.f32, shape=())
-SIG_f = ti.field(dtype=ti.f32, shape=())
-SIGF_f = ti.field(dtype=ti.f32, shape=())
-R2_f = ti.field(dtype=ti.f32, shape=())
-sigma_ln_f = ti.field(dtype=ti.f32, shape=())
-mu_ln_f = ti.field(dtype=ti.f32, shape=())
-maxR_f = ti.field(dtype=ti.f32, shape=())
-lambda_fac_f = ti.field(dtype=ti.f32, shape=())
-ag_f = ti.field(dtype=ti.f32, shape=())
-
-# consts
-π = math.pi
-uMax = 1.0
-eps = 1e-5
-U32 = ti.u32
-S = args.samples
-
-
-# ─────────────────────── RNG helpers (unchanged) ─────────────────────────────
+# ─────────────────── random helpers and kernel ───────────────────────────────
 @ti.func
-def wang(seed: U32) -> U32:
+def wang(seed: ti.u32) -> ti.u32:
     seed = (seed ^ 61) ^ (seed >> 16)
     seed *= 9
     seed ^= seed >> 4
@@ -150,7 +89,7 @@ def wang(seed: U32) -> U32:
 
 
 @ti.func
-def xor_shift(s: U32) -> U32:
+def xor_shift(s: ti.u32) -> ti.u32:
     s ^= s << 13
     s ^= s >> 17
     s ^= s << 5
@@ -159,37 +98,37 @@ def xor_shift(s: U32) -> U32:
 
 @ti.dataclass
 class Rnd:
-    s: U32
+    s: ti.u32
     v: ti.f32
 
 
 @ti.func
-def rnd01(state: U32) -> Rnd:
+def rnd01(state):  # [0,1)
     ns = xor_shift(state)
-    return Rnd(ns, ns * (1 / 4294967295.0))
+    return Rnd(ns, ns * (1.0 / 4294967295.0))
 
 
 @ti.func
-def rnd_gauss(state: U32) -> Rnd:
+def rnd_gauss(state):
     r1 = rnd01(state)
     r2 = rnd01(r1.s)
-    r = ti.sqrt(-2 * ti.log(r1.v + 1e-12))
-    return Rnd(r2.s, r * ti.cos(2 * π * r2.v))
+    r = ti.sqrt(-2.0 * ti.log(r1.v + 1e-12))
+    return Rnd(r2.s, r * ti.cos(2.0 * math.pi * r2.v))
 
 
 @ti.func
-def rnd_poisson(state: U32, lam, expLam) -> Rnd:
+def rnd_poisson(state, lam, expLam):
     r = rnd01(state)
     u = r.v
-    x = U32(0)
+    x = ti.u32(0)
     prod = expLam
     summ = expLam
-    lim = ti.cast(ti.floor(1e4 * lam), U32)
+    lim = ti.cast(ti.floor(1e4 * lam), ti.u32)
     while (u > summ) and (x < lim):
         x += 1
         prod *= lam / ti.cast(x, ti.f32)
         summ += prod
-    return Rnd(r.s, x)
+    return Rnd(r.s, ti.cast(x, ti.f32))
 
 
 @ti.func
@@ -197,11 +136,9 @@ def sq(a, b, c, d):
     return (a - c) * (a - c) + (b - d) * (b - d)
 
 
-# ─────────────────────────── Render kernel ───────────────────────────────────
 @ti.kernel
-def render(seed: U32):
+def render(seed: ti.u32):
     fseed = wang(seed)
-    # R = R_f[None]
     SIG = SIG_f[None]
     SIG_F = SIGF_f[None]
     R2 = R2_f[None]
@@ -212,20 +149,19 @@ def render(seed: U32):
     ag = ag_f[None]
 
     for py, px in neg:
-        st = wang(U32(py * 73856093 ^ px * 19349663 ^ fseed))
+        st = wang(ti.u32(py * 73856093 ^ px * 19349663 ^ fseed))
         hit = 0.0
-        for _ in range(S):
+        for _ in range(args.samples):
             g1 = rnd_gauss(st)
             st = g1.s
             g2 = rnd_gauss(st)
             st = g2.s
-
             xG = ti.cast(px, ti.f32) + SIG_F * g1.v
             yG = ti.cast(py, ti.f32) + SIG_F * g2.v
             ix = ti.cast(tm.clamp(ti.floor(xG), 0, W_sim - 1), ti.i32)
             iy = ti.cast(tm.clamp(ti.floor(yG), 0, H_sim - 1), ti.i32)
 
-            u = tm.clamp(src_tex[iy, ix], 0.0, uMax - eps)
+            u = tm.clamp(src_tex[iy, ix], 0.0, 1.0 - EPSILON)
             lam = -λ_fac * ti.log(1.0 - u)
             exL = ti.exp(-lam)
 
@@ -239,7 +175,7 @@ def render(seed: U32):
             while cx <= maxX and not covered:
                 cy = minY
                 while cy <= maxY and not covered:
-                    cs = wang(U32((cy & 0xFFFF) << 16 | (cx & 0xFFFF)) + fseed)
+                    cs = wang(ti.u32(((cy & 0xFFFF) << 16) | (cx & 0xFFFF)) + fseed)
                     rP = rnd_poisson(cs, lam, exL)
                     cs = rP.s
                     for z in range(ti.cast(rP.v, ti.i32)):
@@ -260,80 +196,77 @@ def render(seed: U32):
                             break
                     cy += 1
                 cx += 1
-            hit += 1 if covered else 0
-        neg[py, px] = 1.0 - hit / S
+            hit += 1.0 if covered else 0.0
+        neg[py, px] = 1.0 - hit / args.samples  # 1 → clear, 0 → opaque
 
 
-# ────────────────────────── Per-layer render loop ────────────────────────────
-def prep_physics(r_px: float, sig_px: float, sig_filter_px: float):
+# ───────────────── grain-physics helper ───────────────────────────────────────
+def prep_physics(r_px, sig_px, sig_filter_px):
     R_f[None] = r_px
     SIG_f[None] = sig_px
     SIGF_f[None] = sig_filter_px
     R2_f[None] = r_px * r_px
+
     if sig_px == 0:
-        sigma2_ln = 0.0
-        sigma_ln = 0.0
+        sigma_ln = sigma2_ln = 0.0
     else:
         sigma2_ln = math.log((sig_px / r_px) ** 2 + 1)
         sigma_ln = math.sqrt(sigma2_ln)
-    sigma_ln_f[None] = sigma_ln
-    mu_ln_f[None] = math.log(r_px) - 0.5 * sigma2_ln
-    maxR = r_px if sig_px == 0 else math.exp(mu_ln_f[None] + 3.0902 * sigma_ln)
-    maxR_f[None] = maxR
-    ag = 1.0 / math.ceil(1.0 / r_px)
+    sigma_ln_f[None], mu_ln_f[None] = sigma_ln, math.log(r_px) - 0.5 * sigma2_ln
+
+    maxR_f[None] = r_px if sig_px == 0 else math.exp(mu_ln_f[None] + 3.0902 * sigma_ln)
+    ag = 1.0 / math.ceil(1.0 / r_px) if r_px > 0 else 1.0
     ag_f[None] = ag
-    lambda_fac_f[None] = ag * ag / (π * (r_px * r_px + sig_px * sig_px))
-
-
-results: List[np.ndarray] = []
-for idx, lay in enumerate(layers_cfg):
-    # convert grain params from final-px → simulation-px
-    r_px = lay["grain_radius"] * SS
-    sig_px = lay["grain_sigma"] * SS
-    sig_flt = lay["sigma_filter"] * SS
-    prep_physics(r_px, sig_px, sig_flt)
-
-    # upload source channel
-    src_tex.from_numpy(src_layers[idx])
-
-    print(
-        f"[Layer {idx}] colour={lay['color']}  samples={S} "
-        f"(R={lay['grain_radius']}px σ={lay['grain_sigma']})"
+    lambda_fac_f[None] = (
+        ag * ag / (math.pi * (r_px * r_px + sig_px * sig_px)) if r_px > 0 else 0.0
     )
-    render(12345 + idx) # Use different seed per layer
-    results.append(neg.to_numpy())
 
 
-# ──────────────────────────── Down-scaler ────────────────────────────────────
-def linear_to_srgb(img: np.ndarray, g: float) -> np.ndarray:
-    return np.where(img <= 0.0031308, img * 12.92, 1.055 * np.power(img, 1 / g) - 0.055)
+# ───────────────────────── simulation loop ───────────────────────────────────
+ray = img_lin.copy()  # through-going light
+results: List[np.ndarray] = []  # density per layer
 
+for idx, (kind, k) in enumerate(order):
+    if kind == "emulsion":
+        emu = emulsions[k]
+        dye = np.array(emu["sensitising_dye_color"], dtype=np.float32) / 255.0
+        channel = int(np.argmin(dye))  # 0 = R, 1 = G, 2 = B
 
-def downscale(np_img: np.ndarray) -> Image.Image:
-    h = H_final
-    w = round(np_img.shape[1] / SS)
-    # Ensure the output is 3-channel RGB for saving
-    if np_img.ndim == 2:
-        np_img = np.stack([np_img] * 3, axis=-1)
-    srgb = np.clip(linear_to_srgb(np_img, args.gamma), 0, 1)
-    return Image.fromarray((srgb * 255).astype(np.uint8)).resize((w, h), Image.LANCZOS)
+        # exposure is the light in that channel only
+        src = 1.0 - np.clip(ray[..., channel], 0.0, 1.0)
+        src_tex.from_numpy(src.astype(np.float32))
 
+        r_px = emu.get("grain_radius", 0.02) * args.supersample
+        sig_px = emu.get("grain_sigma", 0.00) * args.supersample
+        sig_f = emu.get("sigma_filter", 0.08) * args.supersample
+        prep_physics(r_px, sig_px, sig_f)
 
-# ───────────────────────── Save composite result ─────────────────────────────
+        print(
+            f"[emu {idx}] channel={channel}  R={r_px/args.supersample:.3f}px σ={sig_px/args.supersample:.3f}px"
+        )
+        render(12345)
+        developed_negative = neg.to_numpy()
+        results.append((channel, developed_negative))
+
+        # reduce only that wavelength component for deeper layers
+        ray[..., channel] *= developed_negative
+    else:  # filter
+        fil = filters[k]
+        fcol = np.array(fil["color"], dtype=np.float32) / 255.0
+        ray *= fcol[None, None, :]
+        print(f"[filter {idx}] colour={fil['color']}")
+
+# ───────────────────────── assemble final negative ───────────────────────────
+pos_rgb = np.ones_like(img_lin)  # start clear (density 0)
+for channel, density in results:
+    pos_rgb[..., channel] = density  # density already is the negative
+
+# ───────────────────────── down-scale & save ─────────────────────────────────
+out = linear_to_srgb(pos_rgb, args.gamma)
+out = np.clip(out, 0, 1)
+out = Image.fromarray((out * 255).astype(np.uint8)).resize(
+    (round(W_sim / args.supersample), args.height), Image.LANCZOS
+)
 out_path = Path(args.output)
-root, ext = out_path.stem, out_path.suffix or ".png"
-
-if film_type == "BW":
-    # BW film has one layer, invert to get positive
-    pos = 1.0 - results[0]
-    downscale(pos).save(f"{root}{ext}")
-else:  # film_type == "NEG"
-    # Create an empty RGB image to composite into
-    pos_rgb = np.zeros_like(img_lin)
-    # Map each simulated layer back to its designated RGB channel
-    for i, lay in enumerate(layers_cfg):
-        col = lay["color"]
-        pos_rgb[..., rgb_index[col]] = 1.0 - results[i]
-    downscale(pos_rgb).save(f"{root}{ext}")
-
-print("[OK] saved →", f"{root}{ext}")
+out.save(out_path)
+print("[OK] saved →", out_path)
