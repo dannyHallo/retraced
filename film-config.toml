@@ -1,5 +1,3 @@
-type = "NEG"
-
 [[emulsion]] # blue layer
 sensitising_dye_color = [255, 255, 0] # since yellow dye absorbs blue light
 grain_radius = 0.04
@@ -28,5 +26,4 @@ sigma_filter = 0.08
 thickness = 20.0
 
 [[back]] 
-# reflectance = 0.0 # if the anti_halation layer is present, the back of the film is not reflective at all
-reflectance = 0.8  # else, the back of the film is reflective
+reflectance = 0.8  # 0.0 -> anti-halation

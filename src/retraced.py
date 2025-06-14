@@ -235,7 +235,9 @@ for idx, (kind, k) in enumerate(order):
         emu = emulsions[k]
         dye = np.array(emu["sensitising_dye_color"], np.float32) / 255.0
         absorb = (1.0 - dye) / (1.0 - dye).sum()
-        src = 1.0 - np.clip(np.tensordot(ray_front, absorb, axes=([-1], [0])), 0.0, 1.0)
+        src = 1.0 - np.clip(
+            np.tensordot(ray_front, absorb, axes=([-1], [0])), 0.0, 1.0
+        )
         src_tex.from_numpy(src.astype(np.float32))
 
         r_px = emu.get("grain_radius", 0.02) * args.supersample
@@ -266,26 +268,29 @@ for idx, (kind, k) in enumerate(order):
         print(f"[back] reflectance={back_refl}")
 
 # ───────────────────── extra post-stack diagnostic (requested) ───────────────
-# ❺─────────────────────────────────────────────────────────────────────────────
-deepest_emu_idx, deepest_emu_k = max(
-    (i, k) for i, (kind, k) in enumerate(order) if kind == "emulsion"
-)
-deepest_flt_idx, deepest_flt_k = max(
-    (i, k) for i, (kind, k) in enumerate(order) if kind == "filter"
-)
+# MODIFICATION: This diagnostic block should only run if a bounce simulation is
+#               going to happen (i.e., reflectance is non-zero).
+if back_refl > EPS:
+    # ❺─────────────────────────────────────────────────────────────────────────────
+    deepest_emu_idx, deepest_emu_k = max(
+        (i, k) for i, (kind, k) in enumerate(order) if kind == "emulsion"
+    )
+    deepest_flt_idx, deepest_flt_k = max(
+        (i, k) for i, (kind, k) in enumerate(order) if kind == "filter"
+    )
 
-print(f"[base] thickness={film_thick}")  # duplicate base
-emu_last = emulsions[deepest_emu_k]
-print(
-    f"[emu {deepest_emu_idx}] dye={emu_last['sensitising_dye_color']}  "
-    f"R={emu_last.get('grain_radius',0.02):.3f}px"
-)
-flt_last = filters[deepest_flt_k]
-print(f"[filter {deepest_flt_idx}] colour={flt_last['color']}")
-print("ray color is too low (below epsilon), terminating...")  # ❻
-# ─────────────────────────────────────────────────────────────────────────────
+    print(f"[base] thickness={film_thick}")  # duplicate base
+    emu_last = emulsions[deepest_emu_k]
+    print(
+        f"[emu {deepest_emu_idx}] dye={emu_last['sensitising_dye_color']}  "
+        f"R={emu_last.get('grain_radius',0.02):.3f}px"
+    )
+    flt_last = filters[deepest_flt_k]
+    print(f"[filter {deepest_flt_idx}] colour={flt_last['color']}")
+    print("ray color is too low (below epsilon), terminating...")  # ❻
+    # ─────────────────────────────────────────────────────────────────────────────
 
-# ─────────────────────–– forward transmittance (no bounce) ───────────────────
+# ─────────────────────---- forward transmittance (no bounce) ───────────────────
 front_rgb = np.ones_like(img_lin)
 for absorb, dens in zip(layer_absorbs, layer_dens):
     front_rgb *= 1.0 - absorb[None, None, :] + absorb[None, None, :] * dens[..., None]
