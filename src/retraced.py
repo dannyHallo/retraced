@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Colour- & B/W-negative film-grain emulator
+"""
+# ───────────────────────── imports ───────────────────────────────────────────
 import argparse, math
 from pathlib import Path
 from typing import List, Tuple
@@ -7,7 +13,7 @@ from PIL import Image
 import taichi as ti, taichi.math as tm
 import tomllib as toml
 
-# ────────────────────────────── CLI ───────────────────────────────────────────
+# ───────────────────────── CLI ───────────────────────────────────────────────
 cli = argparse.ArgumentParser(description="Colour-negative film-grain emulator")
 cli.add_argument("--input", required=True)
 cli.add_argument("--height", type=int, default=1080)
@@ -19,16 +25,16 @@ cli.add_argument("--film_cfg", default="film-config.toml")
 cli.add_argument("--output", default="out.png")
 args = cli.parse_args()
 
-# ─────────────── read TOML while preserving block order ──────────────────────
+# ── read TOML while preserving block order (for readable logs) ───────────────
 cfg_txt = Path(args.film_cfg).read_text(encoding="utf8")
 order: List[Tuple[str, int]] = []
-seen = {"emulsion": 0, "filter": 0, "film_base": 0, "back": 0}
+_seen = {"emulsion": 0, "filter": 0, "film_base": 0, "back": 0}
 for ln in cfg_txt.splitlines():
     ln = ln.strip()
-    for key in seen:
-        if ln.startswith(f"[[{key}]]"):
-            order.append((key, seen[key]))
-            seen[key] += 1
+    for k in _seen:
+        if ln.startswith(f"[[{k}]]"):
+            order.append((k, _seen[k]))
+            _seen[k] += 1
 
 cfg = toml.loads(cfg_txt)
 emulsions = cfg.get("emulsion", [])
@@ -46,12 +52,12 @@ if not bases:
 if not backs:
     backs.append({"reflectance": 0.0})
 
-film_thick = float(bases[0].get("thickness", 1.0))  # µm → “film units”
+film_thick = float(bases[0].get("thickness", 1.0))
 back_refl = float(backs[0].get("reflectance", 0.0))
 EPS = 1e-5
 
 
-# ───────────────────── colour-space helpers ───────────────────────────────────
+# ─────────────── colour‐space helpers ────────────────────────────────────────
 def srgb_to_linear(a, g):
     a = a / 255.0
     return np.where(a <= 0.04045, a / 12.92, ((a + 0.055) / 1.055) ** g).astype(
@@ -60,30 +66,29 @@ def srgb_to_linear(a, g):
 
 
 def linear_to_srgb(a, g):
-    return np.where(a <= 0.0031308, a * 12.92, 1.055 * a ** (1.0 / g) - 0.055)
+    return np.where(a <= 0.0031308, a * 12.92, 1.055 * a ** (1 / g) - 0.055)
 
 
-# ───────────────────────── Taichi init & image load ───────────────────────────
+# ───────────────────── Taichi + input image ──────────────────────────────────
 ti.init(arch=ti.gpu, default_ip=ti.i32, random_seed=0)
 
 pil_in = Image.open(args.input).convert("RGB")
 H_sim = args.height * args.supersample
 W_sim = round(pil_in.width * H_sim / pil_in.height)
 img_lin = srgb_to_linear(
-    np.asarray(pil_in.resize((W_sim, H_sim), Image.LANCZOS), dtype=np.float32),
-    args.gamma,
+    np.asarray(pil_in.resize((W_sim, H_sim), Image.LANCZOS), np.float32), args.gamma
 )
 
-# ────────────────────────── Taichi fields (grain sim) ────────────────────────
-src_tex = ti.field(ti.f32, shape=(H_sim, W_sim))
-neg = ti.field(ti.f32, shape=(H_sim, W_sim))
+# ─────────────── Taichi fields for grain simulation ──────────────────────────
+src_tex = ti.field(ti.f32, shape=(H_sim, W_sim))  # scene luminance for exposure
+neg = ti.field(ti.f32, shape=(H_sim, W_sim))  # 1→clear, 0→opaque
 
 R_f, SIG_f, SIGF_f, R2_f = (ti.field(ti.f32, shape=()) for _ in range(4))
 sigma_ln_f, mu_ln_f, maxR_f = (ti.field(ti.f32, shape=()) for _ in range(3))
 lambda_fac_f, ag_f = (ti.field(ti.f32, shape=()) for _ in range(2))
 
 
-# ─────────────────── random helpers (Wang, XOR-shift) ────────────────────────
+# ────────────────────── RNG helpers (Wang & XOR-shift) ───────────────────────
 @ti.func
 def wang(seed: ti.u32) -> ti.u32:
     seed = (seed ^ 61) ^ (seed >> 16)
@@ -119,7 +124,7 @@ def rnd_gauss(state):
     r1 = rnd01(state)
     r2 = rnd01(r1.s)
     r = ti.sqrt(-2.0 * ti.log(r1.v + 1e-12))
-    return Rnd(r2.s, r * ti.cos(2.0 * math.pi * r2.v))
+    return Rnd(r2.s, r * ti.cos(2 * math.pi * r2.v))
 
 
 @ti.func
@@ -141,7 +146,7 @@ def sq(a, b, c, d):
     return (a - c) * (a - c) + (b - d) * (b - d)
 
 
-# ───────────────────────────── grain kernel ──────────────────────────────────
+# ───────────────────────── grain kernel ──────────────────────────────────────
 @ti.kernel
 def render(seed: ti.u32, n_samples: ti.i32):
     fseed = wang(seed)
@@ -201,11 +206,9 @@ def render(seed: ti.u32, n_samples: ti.i32):
         neg[py, px] = 1.0 - hit / n_samples  # 1→clear, 0→opaque
 
 
-# ───────────────── physics parameter packing helper ───────────────────────────
+# ─── physics parameter packing helper ────────────────────────────────────────
 def prep_physics(r_px, sig_px, sigF_px):
-    R_f[None] = r_px
-    SIG_f[None] = sig_px
-    SIGF_f[None] = sigF_px
+    R_f[None], SIG_f[None], SIGF_f[None] = r_px, sig_px, sigF_px
     R2_f[None] = r_px * r_px
     if sig_px == 0:
         sigma2_ln = sigma_ln = 0.0
@@ -222,22 +225,41 @@ def prep_physics(r_px, sig_px, sigF_px):
     )
 
 
-# ───────────────────────── front-to-back traversal ───────────────────────────
-ray_front = img_lin.copy()
-layer_absorbs: List[np.ndarray] = []
-layer_dens: List[np.ndarray] = []
-layer_depths: List[float] = []
+# ─── helper: build (absorb_strength, exposure_weights) from dye colour ───────
+def build_vectors(dye_rgb: List[int]):
+    dye = np.asarray(dye_rgb, np.float32) / 255.0
+    comp = 1.0 - dye  # what the developed silver blocks
+    # Panchromatic B/W layer
+    if np.allclose(comp, 1.0):
+        absorb = np.array([1.0, 1.0, 1.0], np.float32)  # can block every colour fully
+        exposeW = np.array(
+            [1 / 3, 1 / 3, 1 / 3], np.float32
+        )  # uniform spectral sensitivity
+        return absorb, exposeW
+    # one-hot layer (colour-negative)
+    if np.count_nonzero(comp) == 1:
+        return comp.astype(np.float32), comp.astype(np.float32)
+    # general chromatic mixture
+    s = comp.sum()
+    exposeW = comp / s if s > 0 else comp
+    return comp.astype(np.float32), exposeW.astype(np.float32)
+
+
+# ─────────────────────────── main traversal ─────────────────────────────────
+ray_front = img_lin.copy()  # what the next emulsion “sees”
+layer_absorbs = []  # absorb_strength vectors
+layer_dens = []  # neg α (0–1)
+layer_depths = []
 
 current_z = 0.0
 print()
 for idx, (kind, k) in enumerate(order):
     if kind == "emulsion":
         emu = emulsions[k]
-        dye = np.array(emu["sensitising_dye_color"], np.float32) / 255.0
-        absorb = (1.0 - dye) / (1.0 - dye).sum()
-        src = 1.0 - np.clip(
-            np.tensordot(ray_front, absorb, axes=([-1], [0])), 0.0, 1.0
-        )
+        absorb, expoW = build_vectors(emu["sensitising_dye_color"])
+
+        # exposure map (single channel, 0→max, 1→min grain density)
+        src = 1.0 - np.clip(np.tensordot(ray_front, expoW, axes=([-1], [0])), 0.0, 1.0)
         src_tex.from_numpy(src.astype(np.float32))
 
         r_px = emu.get("grain_radius", 0.02) * args.supersample
@@ -246,8 +268,7 @@ for idx, (kind, k) in enumerate(order):
         prep_physics(r_px, sig_px, sig_f)
 
         print(
-            f"[emu {idx}] dye={emu['sensitising_dye_color']}  "
-            f"R={r_px/args.supersample:.3f}px"
+            f"[emu {idx}] dye={emu['sensitising_dye_color']}  R={r_px/args.supersample:.3f}px"
         )
         render(12345 + idx * 19, args.samples)
         dens = neg.to_numpy()
@@ -259,7 +280,7 @@ for idx, (kind, k) in enumerate(order):
         ray_front *= 1.0 - absorb[None, None, :] * (1.0 - dens[..., None])
 
     elif kind == "filter":
-        col = np.array(filters[k]["color"], np.float32) / 255.0
+        col = np.asarray(filters[k]["color"], np.float32) / 255.0
         ray_front *= col[None, None, :]
         print(f"[filter {idx}] colour={filters[k]['color']}")
     elif kind == "film_base":
@@ -267,62 +288,36 @@ for idx, (kind, k) in enumerate(order):
     elif kind == "back":
         print(f"[back] reflectance={back_refl}")
 
-# ───────────────────── extra post-stack diagnostic (requested) ───────────────
-# MODIFICATION: This diagnostic block should only run if a bounce simulation is
-#               going to happen (i.e., reflectance is non-zero).
-if back_refl > EPS:
-    # ❺─────────────────────────────────────────────────────────────────────────────
-    deepest_emu_idx, deepest_emu_k = max(
-        (i, k) for i, (kind, k) in enumerate(order) if kind == "emulsion"
-    )
-    deepest_flt_idx, deepest_flt_k = max(
-        (i, k) for i, (kind, k) in enumerate(order) if kind == "filter"
-    )
-
-    print(f"[base] thickness={film_thick}")  # duplicate base
-    emu_last = emulsions[deepest_emu_k]
-    print(
-        f"[emu {deepest_emu_idx}] dye={emu_last['sensitising_dye_color']}  "
-        f"R={emu_last.get('grain_radius',0.02):.3f}px"
-    )
-    flt_last = filters[deepest_flt_k]
-    print(f"[filter {deepest_flt_idx}] colour={flt_last['color']}")
-    print("ray color is too low (below epsilon), terminating...")  # ❻
-    # ─────────────────────────────────────────────────────────────────────────────
-
-# ─────────────────────---- forward transmittance (no bounce) ───────────────────
+# ───────────────────────── forward transmittance ────────────────────────────
 front_rgb = np.ones_like(img_lin)
 for absorb, dens in zip(layer_absorbs, layer_dens):
     front_rgb *= 1.0 - absorb[None, None, :] + absorb[None, None, :] * dens[..., None]
 
-# ───────────────────── back-bounce (with parallax fix ❶-❷-❸-❹) ───────────────
+# ───────────────────── back-bounce / halation (optional) ─────────────────────
 if back_refl > EPS:
     n_layers = len(layer_dens)
     front_rgb_f = ti.Vector.field(3, ti.f32, shape=(H_sim, W_sim))
     bounced_rgb_f = ti.Vector.field(3, ti.f32, shape=(H_sim, W_sim))
-    dens_layers_f = ti.field(ti.f32, shape=(n_layers, H_sim, W_sim))
-    absorb_layers_f = ti.Vector.field(3, ti.f32, shape=n_layers)
+    dens_f = ti.field(ti.f32, shape=(n_layers, H_sim, W_sim))
+    absorb_f = ti.Vector.field(3, ti.f32, shape=n_layers)
     depth_f = ti.field(ti.f32, shape=n_layers)
 
     front_rgb_f.from_numpy(front_rgb.astype(np.float32))
-    dens_layers_f.from_numpy(np.stack(layer_dens, axis=0).astype(np.float32))
-    absorb_layers_f.from_numpy(np.stack(layer_absorbs, axis=0).astype(np.float32))
+    dens_f.from_numpy(np.stack(layer_dens, 0).astype(np.float32))
+    absorb_f.from_numpy(np.stack(layer_absorbs, 0).astype(np.float32))
     depth_f.from_numpy(
-        np.asarray(layer_depths, dtype=np.float32)
-        / max(layer_depths[-1], 1.0)
-        * film_thick
+        np.asarray(layer_depths, np.float32) / max(layer_depths[-1], 1.0) * film_thick
     )
 
-    S = args.bounce_samples
-    film_px = film_thick
+    S, film_px = args.bounce_samples, film_thick
 
     @ti.func
-    def hemi_cosine(state):
-        r1 = rnd01(state)
+    def hemi_cosine(st):
+        r1 = rnd01(st)
         r2 = rnd01(r1.s)
         z = ti.sqrt(r1.v)
         r = ti.sqrt(1.0 - z * z)
-        phi = 2.0 * math.pi * r2.v
+        phi = 2 * math.pi * r2.v
         return Rnd(r2.s, tm.vec3(r * ti.cos(phi), r * ti.sin(phi), z))
 
     @ti.kernel
@@ -331,8 +326,7 @@ if back_refl > EPS:
         for py, px in bounced_rgb_f:
             st = wang(ti.u32(py * 9781 ^ px * 6271 ^ fseed))
             acc = tm.vec3(0.0)
-            x0 = ti.cast(px, ti.f32)
-            y0 = ti.cast(py, ti.f32)
+            x0, y0 = ti.cast(px, ti.f32), ti.cast(py, ti.f32)
             for _ in range(S):
                 dir = hemi_cosine(st)
                 st = dir.s
@@ -340,24 +334,24 @@ if back_refl > EPS:
                     continue
                 x_exit = x0 + dir.v.x * film_px / dir.v.z
                 y_exit = y0 + dir.v.y * film_px / dir.v.z
-                ix = ti.cast(tm.floor(x_exit), ti.i32)
-                iy = ti.cast(tm.floor(y_exit), ti.i32)
+                ix, iy = ti.cast(tm.floor(x_exit), ti.i32), ti.cast(
+                    tm.floor(y_exit), ti.i32
+                )
                 if not (0 <= ix < W_sim and 0 <= iy < H_sim):
                     continue
                 col = front_rgb_f[iy, ix]
-
-                for l in ti.static(range(n_layers)):  # ❸
+                for l in ti.static(range(n_layers)):
                     z_l = depth_f[l]
-                    x_l = x0 + dir.v.x * z_l / dir.v.z  # ❶
-                    y_l = y0 + dir.v.y * z_l / dir.v.z  # ❷
+                    x_l = x0 + dir.v.x * z_l / dir.v.z
+                    y_l = y0 + dir.v.y * z_l / dir.v.z
                     ix_l = ti.cast(tm.floor(x_l), ti.i32)
                     iy_l = ti.cast(tm.floor(y_l), ti.i32)
                     dv = (
-                        dens_layers_f[l, iy_l, ix_l]
+                        dens_f[l, iy_l, ix_l]
                         if (0 <= ix_l < W_sim and 0 <= iy_l < H_sim)
                         else 1.0
                     )
-                    ab = absorb_layers_f[l]
+                    ab = absorb_f[l]
                     col *= 1.0 - ab + ab * dv
                 acc += col
             bounced_rgb_f[py, px] = acc / ti.max(1, S)
@@ -367,7 +361,7 @@ if back_refl > EPS:
 else:
     final_rgb = front_rgb
 
-# ────────────────────────── save PNG (down-sample) ───────────────────────────
+# ───────────────────────── save PNG ──────────────────────────────────────────
 out = linear_to_srgb(final_rgb, args.gamma)
 Image.fromarray((out * 255).astype(np.uint8)).resize(
     (round(W_sim / args.supersample), args.height), Image.LANCZOS
