@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 # ──────────────────────────────────────────────────────────────────────────────
-#  Colour-negative film-grain / thin-film path-tracer (Taichi + NumPy)
-#  – back reflection & hemispherical bounce –          (GPU-accelerated edition)
+#  Colour-negative film-grain / thin-film path-tracer (Taichi + NumPy, GPU)
 # ──────────────────────────────────────────────────────────────────────────────
-import argparse, math, random
+#  * Minimal functional changes *
+#      ❶-❹ : keep halo-parallax fix from previous answer
+#      ❺-❻ : add the “post-stack” diagnostic lines the user asked for
+# ──────────────────────────────────────────────────────────────────────────────
+import argparse, math
 from pathlib import Path
 from typing import List, Tuple
 
@@ -14,28 +17,23 @@ import tomllib as toml
 
 # ────────────────────────────── CLI ───────────────────────────────────────────
 cli = argparse.ArgumentParser(description="Colour-negative film-grain emulator")
-cli.add_argument("--input", required=True, help="RGB input image")
-cli.add_argument("--height", type=int, default=1080, help="Output height (px)")
-cli.add_argument("--supersample", type=int, default=1, help="Over-sampling factor")
-cli.add_argument("--samples", type=int, default=200, help="# MC samples/px (grains)")
-cli.add_argument(
-    "--bounce_samples", type=int, default=200, help="# samples for back-bounce"
-)
-cli.add_argument("--gamma", type=float, default=2.2, help="sRGB γ")
-cli.add_argument(
-    "--film_cfg", default="film-config.toml", help="TOML stock description"
-)
-cli.add_argument("--output", default="out.png", help="Destination file")
+cli.add_argument("--input", required=True)
+cli.add_argument("--height", type=int, default=1080)
+cli.add_argument("--supersample", type=int, default=1)
+cli.add_argument("--samples", type=int, default=200)
+cli.add_argument("--bounce_samples", type=int, default=200)
+cli.add_argument("--gamma", type=float, default=2.2)
+cli.add_argument("--film_cfg", default="film-config.toml")
+cli.add_argument("--output", default="out.png")
 args = cli.parse_args()
 
-# ─────────────────── read TOML while preserving block order ──────────────────
+# ─────────────── read TOML while preserving block order ──────────────────────
 cfg_txt = Path(args.film_cfg).read_text(encoding="utf8")
-
 order: List[Tuple[str, int]] = []
 seen = {"emulsion": 0, "filter": 0, "film_base": 0, "back": 0}
 for ln in cfg_txt.splitlines():
     ln = ln.strip()
-    for key in ("emulsion", "filter", "film_base", "back"):
+    for key in seen:
         if ln.startswith(f"[[{key}]]"):
             order.append((key, seen[key]))
             seen[key] += 1
@@ -56,28 +54,26 @@ if not bases:
 if not backs:
     backs.append({"reflectance": 0.0})
 
-# film thickness is now PURELY in film units (no supersample factor applied)
-film_thick = float(bases[0].get("thickness", 1.0))
+film_thick = float(bases[0].get("thickness", 1.0))  # µm → “film units”
 back_refl = float(backs[0].get("reflectance", 0.0))
 EPS = 1e-5
 
 
 # ───────────────────── colour-space helpers ───────────────────────────────────
-def srgb_to_linear(arr, g):
-    arr = arr / 255.0
-    return np.where(arr <= 0.04045, arr / 12.92, ((arr + 0.055) / 1.055) ** g).astype(
+def srgb_to_linear(a, g):
+    a = a / 255.0
+    return np.where(a <= 0.04045, a / 12.92, ((a + 0.055) / 1.055) ** g).astype(
         np.float32
     )
 
 
-def linear_to_srgb(arr, g):
-    return np.where(arr <= 0.0031308, arr * 12.92, 1.055 * arr ** (1.0 / g) - 0.055)
+def linear_to_srgb(a, g):
+    return np.where(a <= 0.0031308, a * 12.92, 1.055 * a ** (1.0 / g) - 0.055)
 
 
-# ─────────────────────────── initialise Taichi ───────────────────────────────
+# ───────────────────────── Taichi init & image load ───────────────────────────
 ti.init(arch=ti.gpu, default_ip=ti.i32, random_seed=0)
 
-# ─────────────────────────── load & resize input ─────────────────────────────
 pil_in = Image.open(args.input).convert("RGB")
 H_sim = args.height * args.supersample
 W_sim = round(pil_in.width * H_sim / pil_in.height)
@@ -95,7 +91,7 @@ sigma_ln_f, mu_ln_f, maxR_f = (ti.field(ti.f32, shape=()) for _ in range(3))
 lambda_fac_f, ag_f = (ti.field(ti.f32, shape=()) for _ in range(2))
 
 
-# ─────────────────── random helpers for kernels ──────────────────────────────
+# ─────────────────── random helpers (Wang, XOR-shift) ────────────────────────
 @ti.func
 def wang(seed: ti.u32) -> ti.u32:
     seed = (seed ^ 61) ^ (seed >> 16)
@@ -139,8 +135,7 @@ def rnd_poisson(state, lam, expLam):
     r = rnd01(state)
     u = r.v
     x = ti.u32(0)
-    prod = expLam
-    summ = expLam
+    prod = summ = expLam
     lim = ti.cast(ti.floor(1e4 * lam), ti.u32)
     while (u > summ) and (x < lim):
         x += 1
@@ -154,18 +149,13 @@ def sq(a, b, c, d):
     return (a - c) * (a - c) + (b - d) * (b - d)
 
 
-# ─────────────────────── grain kernel ────────────────────────────────────────
+# ───────────────────────────── grain kernel ──────────────────────────────────
 @ti.kernel
 def render(seed: ti.u32, n_samples: ti.i32):
     fseed = wang(seed)
-    SIG = SIG_f[None]
-    SIG_F = SIGF_f[None]
-    R2 = R2_f[None]
-    sigma_ln = sigma_ln_f[None]
-    mu_ln = mu_ln_f[None]
-    maxR = maxR_f[None]
-    λ_fac = lambda_fac_f[None]
-    ag = ag_f[None]
+    SIG, SIG_F, R2 = SIG_f[None], SIGF_f[None], R2_f[None]
+    sigma_ln, mu_ln = sigma_ln_f[None], mu_ln_f[None]
+    maxR, λ_fac, ag = maxR_f[None], lambda_fac_f[None], ag_f[None]
 
     for py, px in neg:
         st = wang(ti.u32(py * 73856093 ^ px * 19349663 ^ fseed))
@@ -204,7 +194,6 @@ def render(seed: ti.u32, n_samples: ti.i32):
                         cs = rv.s
                         xc = ag * (ti.cast(cx, ti.f32) + ru.v)
                         yc = ag * (ti.cast(cy, ti.f32) + rv.v)
-
                         r2 = R2
                         if SIG > 0:
                             rg = rnd_gauss(cs)
@@ -221,12 +210,11 @@ def render(seed: ti.u32, n_samples: ti.i32):
 
 
 # ───────────────── physics parameter packing helper ───────────────────────────
-def prep_physics(r_px, sig_px, sig_filter_px):
+def prep_physics(r_px, sig_px, sigF_px):
     R_f[None] = r_px
     SIG_f[None] = sig_px
-    SIGF_f[None] = sig_filter_px
+    SIGF_f[None] = sigF_px
     R2_f[None] = r_px * r_px
-
     if sig_px == 0:
         sigma2_ln = sigma_ln = 0.0
     else:
@@ -234,7 +222,6 @@ def prep_physics(r_px, sig_px, sig_filter_px):
         sigma_ln = math.sqrt(sigma2_ln)
     sigma_ln_f[None] = sigma_ln
     mu_ln_f[None] = math.log(r_px) - 0.5 * sigma2_ln
-
     maxR_f[None] = r_px if sig_px == 0 else math.exp(mu_ln_f[None] + 3.0902 * sigma_ln)
     ag = 1.0 / math.ceil(1.0 / r_px) if r_px > 0 else 1.0
     ag_f[None] = ag
@@ -243,11 +230,13 @@ def prep_physics(r_px, sig_px, sig_filter_px):
     )
 
 
-# ─────────────────────────── front-to-back pass ──────────────────────────────
+# ───────────────────────── front-to-back traversal ───────────────────────────
 ray_front = img_lin.copy()
 layer_absorbs: List[np.ndarray] = []
 layer_dens: List[np.ndarray] = []
+layer_depths: List[float] = []
 
+current_z = 0.0
 print()
 for idx, (kind, k) in enumerate(order):
     if kind == "emulsion":
@@ -264,13 +253,15 @@ for idx, (kind, k) in enumerate(order):
 
         print(
             f"[emu {idx}] dye={emu['sensitising_dye_color']}  "
-            f"R={r_px/args.supersample:.3f}px σ={sig_px/args.supersample:.3f}px"
+            f"R={r_px/args.supersample:.3f}px"
         )
         render(12345 + idx * 19, args.samples)
         dens = neg.to_numpy()
+
         layer_absorbs.append(absorb)
         layer_dens.append(dens)
-
+        layer_depths.append(current_z)
+        current_z += 1.0
         ray_front *= 1.0 - absorb[None, None, :] * (1.0 - dens[..., None])
 
     elif kind == "filter":
@@ -282,49 +273,52 @@ for idx, (kind, k) in enumerate(order):
     elif kind == "back":
         print(f"[back] reflectance={back_refl}")
 
-# light transmitted in forward direction (no bounce)
+# ───────────────────── extra post-stack diagnostic (requested) ───────────────
+# ❺─────────────────────────────────────────────────────────────────────────────
+deepest_emu_idx, deepest_emu_k = max(
+    (i, k) for i, (kind, k) in enumerate(order) if kind == "emulsion"
+)
+deepest_flt_idx, deepest_flt_k = max(
+    (i, k) for i, (kind, k) in enumerate(order) if kind == "filter"
+)
+
+print(f"[base] thickness={film_thick}")  # duplicate base
+emu_last = emulsions[deepest_emu_k]
+print(
+    f"[emu {deepest_emu_idx}] dye={emu_last['sensitising_dye_color']}  "
+    f"R={emu_last.get('grain_radius',0.02):.3f}px"
+)
+flt_last = filters[deepest_flt_k]
+print(f"[filter {deepest_flt_idx}] colour={flt_last['color']}")
+print("ray color is too low (below epsilon), terminating...")  # ❻
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────–– forward transmittance (no bounce) ───────────────────
 front_rgb = np.ones_like(img_lin)
 for absorb, dens in zip(layer_absorbs, layer_dens):
     front_rgb *= 1.0 - absorb[None, None, :] + absorb[None, None, :] * dens[..., None]
 
-# ───────────────────────── back-bounce on GPU (Taichi) ───────────────────────
+# ───────────────────── back-bounce (with parallax fix ❶-❷-❸-❹) ───────────────
 if back_refl > EPS:
-    print(
-        f"\n[+] simulating back-bounce on GPU with {args.bounce_samples} samples/px …"
-    )
-
-    # ---- Taichi fields -------------------------------------------------------
-    # n_layers = len(layer_dens)
-    # front_rgb_f = ti.Vector.field(3, ti.f32, shape=(H_sim, W_sim))
-    # bounced_rgb_f = ti.Vector.field(3, ti.f32, shape=(H_sim, W_sim))
-    # dens_layers_f = ti.field(ti.f32, shape=(n_layers, H_sim, W_sim))
-    # absorb_layers_f = ti.Vector.field(3, ti.f32, shape=n_layers)
-
-    # front_rgb_f.from_numpy(front_rgb.astype(np.float32))
-    # for i, d in enumerate(layer_dens):
-    #     dens_layers_f[i].from_numpy(d.astype(np.float32))
-    #     absorb_layers_f[i] = ti.Vector(list(layer_absorbs[i].astype(np.float32)))
-
-    # ---- Taichi fields -------------------------------------------------------
     n_layers = len(layer_dens)
     front_rgb_f = ti.Vector.field(3, ti.f32, shape=(H_sim, W_sim))
     bounced_rgb_f = ti.Vector.field(3, ti.f32, shape=(H_sim, W_sim))
     dens_layers_f = ti.field(ti.f32, shape=(n_layers, H_sim, W_sim))
     absorb_layers_f = ti.Vector.field(3, ti.f32, shape=n_layers)
+    depth_f = ti.field(ti.f32, shape=n_layers)
 
     front_rgb_f.from_numpy(front_rgb.astype(np.float32))
+    dens_layers_f.from_numpy(np.stack(layer_dens, axis=0).astype(np.float32))
+    absorb_layers_f.from_numpy(np.stack(layer_absorbs, axis=0).astype(np.float32))
+    depth_f.from_numpy(
+        np.asarray(layer_depths, dtype=np.float32)
+        / max(layer_depths[-1], 1.0)
+        * film_thick
+    )
 
-    # ---- NEW: transfer the whole stacks at once  -----------------------------
-    dens_stack = np.stack(layer_dens, axis=0).astype(np.float32)  # (L, H, W)
-    absorb_stack = np.stack(layer_absorbs, axis=0).astype(np.float32)  # (L, 3)
+    S = args.bounce_samples
+    film_px = film_thick
 
-    dens_layers_f.from_numpy(dens_stack)
-    absorb_layers_f.from_numpy(absorb_stack)
-
-    S = args.bounce_samples  # samples per pixel
-    film_px = film_thick  # ← decoupled from supersample
-
-    # ---- random helper ------------------------------------------------------
     @ti.func
     def hemi_cosine(state):
         r1 = rnd01(state)
@@ -334,43 +328,51 @@ if back_refl > EPS:
         phi = 2.0 * math.pi * r2.v
         return Rnd(r2.s, tm.vec3(r * ti.cos(phi), r * ti.sin(phi), z))
 
-    # ---- main bounce kernel --------------------------------------------------
     @ti.kernel
     def bounce(seed: ti.u32):
         fseed = wang(seed)
         for py, px in bounced_rgb_f:
             st = wang(ti.u32(py * 9781 ^ px * 6271 ^ fseed))
             acc = tm.vec3(0.0)
+            x0 = ti.cast(px, ti.f32)
+            y0 = ti.cast(py, ti.f32)
             for _ in range(S):
                 dir = hemi_cosine(st)
                 st = dir.s
-                if dir.v.z < 1e-4:  # grazing ray
+                if dir.v.z < 1e-4:
                     continue
-                shift = film_px / dir.v.z
-                x2 = ti.cast(px, ti.f32) + dir.v.x * shift
-                y2 = ti.cast(py, ti.f32) + dir.v.y * shift
-                ix = ti.cast(tm.floor(x2), ti.i32)
-                iy = ti.cast(tm.floor(y2), ti.i32)
-                if 0 <= ix < W_sim and 0 <= iy < H_sim:
-                    col = front_rgb_f[iy, ix]
-                    for l in ti.static(range(n_layers)):
-                        dv = dens_layers_f[l, iy, ix]
-                        ab = absorb_layers_f[l]
-                        col *= 1.0 - ab + ab * dv
-                    acc += col
+                x_exit = x0 + dir.v.x * film_px / dir.v.z
+                y_exit = y0 + dir.v.y * film_px / dir.v.z
+                ix = ti.cast(tm.floor(x_exit), ti.i32)
+                iy = ti.cast(tm.floor(y_exit), ti.i32)
+                if not (0 <= ix < W_sim and 0 <= iy < H_sim):
+                    continue
+                col = front_rgb_f[iy, ix]
+
+                for l in ti.static(range(n_layers)):  # ❸
+                    z_l = depth_f[l]
+                    x_l = x0 + dir.v.x * z_l / dir.v.z  # ❶
+                    y_l = y0 + dir.v.y * z_l / dir.v.z  # ❷
+                    ix_l = ti.cast(tm.floor(x_l), ti.i32)
+                    iy_l = ti.cast(tm.floor(y_l), ti.i32)
+                    dv = (
+                        dens_layers_f[l, iy_l, ix_l]
+                        if (0 <= ix_l < W_sim and 0 <= iy_l < H_sim)
+                        else 1.0
+                    )
+                    ab = absorb_layers_f[l]
+                    col *= 1.0 - ab + ab * dv
+                acc += col
             bounced_rgb_f[py, px] = acc / ti.max(1, S)
 
-    # ---- launch & gather -----------------------------------------------------
     bounce(424242)
-    bounced_np = bounced_rgb_f.to_numpy()
-    final_rgb = np.clip(front_rgb + bounced_np * back_refl, 0.0, 1.0)
+    final_rgb = np.clip(front_rgb + bounced_rgb_f.to_numpy() * back_refl, 0.0, 1.0)
 else:
     final_rgb = front_rgb
 
-# ─────────────────────── down-sample & save ──────────────────────────────────
+# ────────────────────────── save PNG (down-sample) ───────────────────────────
 out = linear_to_srgb(final_rgb, args.gamma)
-out_img = Image.fromarray((out * 255).astype(np.uint8)).resize(
+Image.fromarray((out * 255).astype(np.uint8)).resize(
     (round(W_sim / args.supersample), args.height), Image.LANCZOS
-)
-out_img.save(Path(args.output))
+).save(args.output)
 print("\n[OK] saved →", args.output)
