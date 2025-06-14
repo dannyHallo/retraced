@@ -1,0 +1,21 @@
+# Kodak-like 3-layer colour negative
+[[layer]]
+color = "B"         # bottommost, sensitive to blue
+grain_radius = 0.02 # in final-image pixels
+grain_sigma = 0.00
+sigma_filter = 0.08
+filter = "yellow"   # yellow filter absorbs blue for lower layers
+
+[[layer]]
+color = "G"         # middle, green-sensitive
+grain_radius = 0.02
+grain_sigma = 0.00
+sigma_filter = 0.08
+filter = "magenta"  # blocks green
+
+[[layer]]
+color = "R"         # topmost layer
+grain_radius = 0.02
+grain_sigma = 0.00
+sigma_filter = 0.08
+# no filter above the last layer
