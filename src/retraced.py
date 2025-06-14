@@ -69,6 +69,11 @@ def linear_to_srgb(a, g):
     return np.where(a <= 0.0031308, a * 12.92, 1.055 * a ** (1 / g) - 0.055)
 
 
+# only needed for the HDR back-bounce stage
+def inverse_reinhard(x: np.ndarray) -> np.ndarray:
+    return x / (1.0 - x + EPS)
+
+
 # ───────────────────── Taichi + input image ──────────────────────────────────
 ti.init(arch=ti.gpu, default_ip=ti.i32, random_seed=0)
 
@@ -81,12 +86,11 @@ img_lin = srgb_to_linear(
 
 # ─────────────── Taichi fields for grain simulation ──────────────────────────
 src_tex = ti.field(ti.f32, shape=(H_sim, W_sim))  # scene luminance for exposure
-neg = ti.field(ti.f32, shape=(H_sim, W_sim))  # 1→clear, 0→opaque
+neg = ti.field(ti.f32, shape=(H_sim, W_sim))      # 1→clear, 0→opaque
 
 R_f, SIG_f, SIGF_f, R2_f = (ti.field(ti.f32, shape=()) for _ in range(4))
 sigma_ln_f, mu_ln_f, maxR_f = (ti.field(ti.f32, shape=()) for _ in range(3))
 lambda_fac_f, ag_f = (ti.field(ti.f32, shape=()) for _ in range(2))
-
 
 # ────────────────────── RNG helpers (Wang & XOR-shift) ───────────────────────
 @ti.func
@@ -229,27 +233,19 @@ def prep_physics(r_px, sig_px, sigF_px):
 def build_vectors(dye_rgb: List[int]):
     dye = np.asarray(dye_rgb, np.float32) / 255.0
     comp = 1.0 - dye  # what the developed silver blocks
-    # Panchromatic B/W layer
-    if np.allclose(comp, 1.0):
-        absorb = np.array([1.0, 1.0, 1.0], np.float32)  # can block every colour fully
-        exposeW = np.array(
+    if np.allclose(comp, 1.0):  # Panchromatic B/W layer
+        return np.array([1.0, 1.0, 1.0], np.float32), np.array(
             [1 / 3, 1 / 3, 1 / 3], np.float32
-        )  # uniform spectral sensitivity
-        return absorb, exposeW
-    # one-hot layer (colour-negative)
-    if np.count_nonzero(comp) == 1:
+        )
+    if np.count_nonzero(comp) == 1:  # one-hot colour layer
         return comp.astype(np.float32), comp.astype(np.float32)
-    # general chromatic mixture
     s = comp.sum()
-    exposeW = comp / s if s > 0 else comp
-    return comp.astype(np.float32), exposeW.astype(np.float32)
+    return comp.astype(np.float32), (comp / s).astype(np.float32)
 
 
 # ─────────────────────────── main traversal ─────────────────────────────────
 ray_front = img_lin.copy()  # what the next emulsion “sees”
-layer_absorbs = []  # absorb_strength vectors
-layer_dens = []  # neg α (0–1)
-layer_depths = []
+layer_absorbs, layer_dens, layer_depths = [], [], []
 
 current_z = 0.0
 print()
@@ -295,6 +291,9 @@ for absorb, dens in zip(layer_absorbs, layer_dens):
 
 # ───────────────────── back-bounce / halation (optional) ─────────────────────
 if back_refl > EPS:
+    # convert the LDR transmittance to HDR radiance only for the bounce
+    front_hdr = inverse_reinhard(np.clip(front_rgb, 0.0, 1.0 - EPS))
+
     n_layers = len(layer_dens)
     front_rgb_f = ti.Vector.field(3, ti.f32, shape=(H_sim, W_sim))
     bounced_rgb_f = ti.Vector.field(3, ti.f32, shape=(H_sim, W_sim))
@@ -302,7 +301,7 @@ if back_refl > EPS:
     absorb_f = ti.Vector.field(3, ti.f32, shape=n_layers)
     depth_f = ti.field(ti.f32, shape=n_layers)
 
-    front_rgb_f.from_numpy(front_rgb.astype(np.float32))
+    front_rgb_f.from_numpy(front_hdr.astype(np.float32))  # ← HDR values
     dens_f.from_numpy(np.stack(layer_dens, 0).astype(np.float32))
     absorb_f.from_numpy(np.stack(layer_absorbs, 0).astype(np.float32))
     depth_f.from_numpy(

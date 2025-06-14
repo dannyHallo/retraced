@@ -1,7 +1,7 @@
 [[emulsion]] # blue layer
 sensitising_dye_color = [255, 255, 0] # since yellow dye absorbs blue light
-grain_radius = 0.04
-grain_sigma = 0.00
+grain_radius = 0.02
+grain_sigma = 0.002
 sigma_filter = 0.08
 
 [[filter]]
@@ -9,8 +9,8 @@ color = [255, 255, 0] # block the blue light from passing through
 
 [[emulsion]] # green layer
 sensitising_dye_color = [255, 0, 255] # since magenta dye absorbs green light
-grain_radius = 0.04
-grain_sigma = 0.00
+grain_radius = 0.02
+grain_sigma = 0.002
 sigma_filter = 0.08
 
 [[filter]]
@@ -18,12 +18,12 @@ color = [255, 0, 255] # block the green light from passing through
 
 [[emulsion]] # red layer
 sensitising_dye_color = [0, 255, 255] # since cyan dye absorbs red light
-grain_radius = 0.04
-grain_sigma = 0.00
+grain_radius = 0.02
+grain_sigma = 0.002
 sigma_filter = 0.08
 
 [[film_base]]
 thickness = 20.0
 
-[[back]] 
-reflectance = 0.8  # 0.0 -> anti-halation
+[[back]]
+reflectance = 0.0001 # 0.0 -> anti-halation
