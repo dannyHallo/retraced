@@ -224,16 +224,22 @@ def prep_physics(r_px, sig_px, sig_filter_px):
 
 # ───────────────────────── simulation loop ───────────────────────────────────
 ray = img_lin.copy()  # through-going light
-results: List[np.ndarray] = []  # density per layer
+results: List[Tuple[np.ndarray, np.ndarray]] = []  # (absorption-weights, density)
 
 for idx, (kind, k) in enumerate(order):
     if kind == "emulsion":
         emu = emulsions[k]
         dye = np.array(emu["sensitising_dye_color"], dtype=np.float32) / 255.0
-        channel = int(np.argmin(dye))  # 0 = R, 1 = G, 2 = B
 
-        # exposure is the light in that channel only
-        src = 1.0 - np.clip(ray[..., channel], 0.0, 1.0)
+        # absorption weights: complement of the dye colour, normalised
+        absorb = 1.0 - dye
+        if absorb.sum() < EPSILON:
+            raise ValueError("Sensitising dye colour must not be pure white")
+        # normalization
+        absorb = absorb / absorb.sum()
+
+        # exposure: luminance seen through the absorption spectrum
+        src = 1.0 - np.clip(np.tensordot(ray, absorb, axes=([-1], [0])), 0.0, 1.0)
         src_tex.from_numpy(src.astype(np.float32))
 
         r_px = emu.get("grain_radius", 0.02) * args.supersample
@@ -242,14 +248,16 @@ for idx, (kind, k) in enumerate(order):
         prep_physics(r_px, sig_px, sig_f)
 
         print(
-            f"[emu {idx}] channel={channel}  R={r_px/args.supersample:.3f}px σ={sig_px/args.supersample:.3f}px"
+            f"[emu {idx}] dye={emu['sensitising_dye_color']}  "
+            f"R={r_px/args.supersample:.3f}px σ={sig_px/args.supersample:.3f}px"
         )
         render(12345)
         developed_negative = neg.to_numpy()
-        results.append((channel, developed_negative))
+        results.append((absorb, developed_negative))
 
-        # reduce only that wavelength component for deeper layers
-        ray[..., channel] *= developed_negative
+        # attenuate spectral components for deeper layers
+        #   factor = 1 - w*(1 - density)
+        ray *= 1.0 - absorb[None, None, :] * (1.0 - developed_negative[..., None])
     else:  # filter
         fil = filters[k]
         fcol = np.array(fil["color"], dtype=np.float32) / 255.0
@@ -257,9 +265,10 @@ for idx, (kind, k) in enumerate(order):
         print(f"[filter {idx}] colour={fil['color']}")
 
 # ───────────────────────── assemble final negative ───────────────────────────
-pos_rgb = np.ones_like(img_lin)  # start clear (density 0)
-for channel, density in results:
-    pos_rgb[..., channel] = density  # density already is the negative
+pos_rgb = np.ones_like(img_lin)
+for absorb, density in results:
+    layer = 1.0 - absorb[None, None, :] + absorb[None, None, :] * density[..., None]
+    pos_rgb *= layer  # successive dye layers multiply
 
 # ───────────────────────── down-scale & save ─────────────────────────────────
 out = linear_to_srgb(pos_rgb, args.gamma)
